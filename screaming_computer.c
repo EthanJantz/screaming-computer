@@ -1,7 +1,11 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_audio.h>
 #include <SDL2/SDL_error.h>
+#include <SDL2/SDL_timer.h>
+#include <math.h>
 #include <stdio.h>
+
+#define PI 3.14159265358979323846
 
 int fan_speed() {
   char *filename = "/proc/acpi/ibm/fan";
@@ -53,9 +57,31 @@ int main() {
   }
 
   int rpm;
+  float src_samples[desired.samples]; // dst_samples[obtained.samples];
 
   rpm = fan_speed();
   printf("fan speed: %d\n", rpm);
+
+  printf("Screaming...\n");
+  int available = 0;
+  float volume = 0.25, a_hz = 440, increment = a_hz / desired.freq * 2 * PI;
+  float phase = 0;
+  while (1) {
+    // fill src buffer with audio data
+    for (int i = 0; i < desired.samples; i++) {
+      src_samples[i] = sinf(phase) * volume;
+      phase += increment;
+      if (phase > (2 * PI))
+        phase -= 2 * PI;
+    };
+    SDL_AudioStreamPut(stream, src_samples, desired.samples * sizeof(float));
+
+    // pause to allow stream to clear
+    if ((available = SDL_AudioStreamAvailable(stream)) < desired.samples)
+      SDL_Delay(1000);
+
+    // fill dest stream with buffer data
+  }
 
   SDL_FreeAudioStream(stream);
   return 0;
