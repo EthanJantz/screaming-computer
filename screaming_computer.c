@@ -45,6 +45,7 @@ int main(void) {
 
   if (device_id == 0) {
     printf("Failed to retrieve audio device: %s\n", SDL_GetError());
+    return 1;
   } else {
     printf("Obtained audio device:\n  id: %d\n  freq: %d\n  ch: %d\n  samples: "
            "%d\n  format: %d\n",
@@ -57,6 +58,7 @@ int main(void) {
                          obtained.format, obtained.channels, obtained.freq);
   if (stream == NULL) {
     printf("Failed to create audio stream: %s\n", SDL_GetError());
+    return 1;
   } else {
     printf("Stream loaded successfully at %p\n", stream);
   }
@@ -76,39 +78,49 @@ int main(void) {
 
   signal(SIGINT, handle_sigint);
   while (running) {
-    // pause to allow stream to clear
-    available = SDL_AudioStreamAvailable(stream);
-    if (available >= desired.samples)
+    rpm = fan_speed();
+    if (rpm > 1000) {
+      // pause to allow stream to clear
+      available = SDL_AudioStreamAvailable(stream);
+      if (available >= desired.samples)
+        SDL_Delay(100);
+
+      // create the data to send to stream
+      for (int i = 0; i < desired.samples; i++) {
+        src_samples[i] = sinf(phase) * volume;
+        phase += increment;
+        if (phase > (2 * PI))
+          phase -= 2 * PI;
+      };
+
+      // send it to the stream
+      int rc = SDL_AudioStreamPut(stream, src_samples,
+                                  desired.samples * sizeof(float));
+      if (rc == -1) {
+        printf("Failed to put data into stream: %s\n", SDL_GetError());
+        return 1;
+      }
+
+      // get the converted data back from the stream
+      int bytes_read = SDL_AudioStreamGet(stream, dst_samples,
+                                          obtained.samples * sizeof(float));
+      if (bytes_read == -1) {
+        printf("Failed to get data from audio stream: %s\n", SDL_GetError());
+        return 1;
+      }
+
+      rc = SDL_QueueAudio(device_id, dst_samples, bytes_read);
+      if (rc < 0) {
+        printf("Failed to queue audio: %s\n", SDL_GetError());
+        return 1;
+      }
+    } else {
       SDL_Delay(100);
-
-    // create the data to send to stream
-    for (int i = 0; i < desired.samples; i++) {
-      src_samples[i] = sinf(phase) * volume;
-      phase += increment;
-      if (phase > (2 * PI))
-        phase -= 2 * PI;
-    };
-
-    // send it to the stream
-    int rc = SDL_AudioStreamPut(stream, src_samples,
-                                desired.samples * sizeof(float));
-    if (rc == -1) {
-      printf("Failed to put data into stream: %s\n", SDL_GetError());
-    }
-
-    // get the converted data back from the stream
-    int bytes_read = SDL_AudioStreamGet(stream, dst_samples,
-                                        obtained.samples * sizeof(float));
-    if (bytes_read == -1) {
-      printf("Failed to get data from audio stream: %s\n", SDL_GetError());
-    }
-
-    rc = SDL_QueueAudio(device_id, dst_samples, bytes_read);
-    if (rc < 0) {
-      printf("Failed to queue audio: %s\n", SDL_GetError());
     }
   }
 
   SDL_FreeAudioStream(stream);
+  SDL_CloseAudioDevice(device_id);
+  SDL_Quit();
   return 0;
 }
