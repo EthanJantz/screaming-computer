@@ -63,12 +63,12 @@ int main(void) {
     printf("Stream loaded successfully at %p\n", stream);
   }
 
-  int rpm;
+  const unsigned MOD_ITER = 5, MAX_FAN_SPEED = 5500;
+  unsigned rpm, iterations = 0;
 
   rpm = fan_speed();
   printf("fan speed: %d\n", rpm);
 
-  printf("Screaming...\n");
   float src_samples[desired.samples], dst_samples[obtained.samples];
   int available = 0;
   float volume = 0.25, a_hz = 440, increment = a_hz / desired.freq * 2 * PI;
@@ -78,7 +78,14 @@ int main(void) {
 
   signal(SIGINT, handle_sigint);
   while (running) {
-    rpm = fan_speed();
+    iterations++;
+    if (iterations % MOD_ITER == 0) { // Prevent unnecssarily I/O
+      rpm = fan_speed();
+      volume = (float)rpm / MAX_FAN_SPEED;
+      volume = volume > .75 ? .75 : volume;
+      printf("fan speed: %d\nvolume: %f\n iter: %d\n", rpm, volume, iterations);
+    }
+
     if (rpm > 1000) {
       // pause to allow stream to clear
       available = SDL_AudioStreamAvailable(stream);
