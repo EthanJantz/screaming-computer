@@ -1,0 +1,78 @@
+"""All tunable constants for the synth and audio engine.
+
+Starting points from the spec (Section 6). Expect to tune by ear. Anything
+specific to a particular work source (e.g. chess node-count bounds) belongs with
+that driver, not here.
+"""
+
+# --- Audio ---
+SAMPLERATE = 44100
+BLOCKSIZE = 512
+
+# --- Voice fundamental ---
+F0 = 110.0  # Hz, fundamental at idle
+
+# A scream rises in pitch as it strains. F0 climbs this many semitones from idle to
+# full intensity (set to 0.0 for the original constant-pitch behaviour). 18 semitones
+# = 1.5 octaves, taking a 110 Hz idle groan up to a ~311 Hz scream at full effort.
+F0_RISE_SEMITONES = 18.0
+
+# Formants for "ahh" (/ɑ/): (center_Hz, bandwidth_Hz)
+FORMANTS = [
+    (730, 90),
+    (1090, 110),
+    (2440, 170),
+    (3500, 250),
+    (4500, 300),
+]
+
+# --- Source rolloff / brightening ---
+P_IDLE = 2.0  # source rolloff exponent at idle (~ -12 dB/oct)
+P_BRIGHT = 1.0  # rolloff at full intensity (brighter/harsher)
+
+# --- Amplitude envelope ---
+AMP_FLOOR = 0.05  # idle voice level
+AMP_PEAK = 0.9  # full-load level (leave headroom under 1.0)
+AMP_CURVE = 1.5
+
+# --- Roughness ---
+# Each ingredient is individually toggleable so it can be A/B'd by ear. Grown one
+# entry at a time as ingredients are added.
+ROUGHNESS = {
+    "jitter": True,
+    "shimmer": True,
+    "subharmonics": True,
+    "chaos": False,
+    "drive": True,
+    "brightening": True,
+}
+
+# Jitter: fast sample-and-hold F0 wobble (hoarseness). Deep + fast like soundgen's
+# jitterDep/jitterLen — slow/shallow jitter reads as vibrato instead of roughness.
+JITTER_MAX = 0.08  # fractional F0 wobble at full intensity (~1.3 semitones)
+JITTER_LEN_MS = 2.0  # sample-and-hold segment length (soundgen jitterLen)
+
+# Shimmer: per-sample random amplitude perturbation (soundgen shimmerDep).
+SHIMMER_MAX = 0.18  # fractional amplitude wobble at full intensity
+SHIMMER_LEN_MS = 3.0  # control segment length (linearly interpolated)
+
+SUB_MAX = 0.4  # subharmonic level at full intensity
+DRIVE_MAX = 6.0  # tanh drive amount added at full intensity
+
+# Pitch chaos: occasional held jumps to a multiple of F0 — deterministic-chaos
+# "breaks" that give screams their wild quality (soundgen chaos_freq). High
+# intensity only.
+CHAOS_THRESH = 0.72  # chaos only above this intensity
+CHAOS_PROB = 0.18  # per-decision jump probability at full intensity
+CHAOS_RATIOS = [0.5, 1.5]  # F0 multipliers a jump can land on
+CHAOS_HOLD_BLOCKS = (2, 6)  # how many blocks a jump persists (min, max)
+CHAOS_GLIDE = 0.35  # per-block glide rate toward the target ratio (0..1);
+# lower = slower portamento. Instant jumps sound like
+# digital distortion, so we glide instead.
+BREATH_IDLE = 0.012  # constant breath/noise floor (RMS); ~0.7x the idle voice RMS
+BREATH_CUTOFF = (
+    4000.0  # Hz, gentle air-rolloff above this in the breath's formant shaping
+)
+
+# --- Intensity smoothing (per audio block) ---
+SMOOTH_COEFF = 0.02  # tune for an attack/release feel of ~0.2-0.6 s
