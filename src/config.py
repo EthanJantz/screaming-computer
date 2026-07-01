@@ -45,6 +45,7 @@ ROUGHNESS = {
     "chaos": False,
     "drive": True,
     "brightening": True,
+    "regimes": True,
 }
 
 # Jitter: fast random F0 wobble (hoarseness). Deep + fast like soundgen's
@@ -66,6 +67,13 @@ SUB_WIDTH_HZ = 4000.0  # Gaussian sd of sideband strength vs Hz-distance to the
 # nearest harmonic (soundgen subWidth); large = flat, small
 # = growl concentrated where harmonics are dense/low
 DRIVE_MAX = 6.0  # tanh drive amount added at full intensity
+
+# Roughness regimes: a bounded random walk gates subharmonics/jitter/shimmer in
+# episodes (soundgen getIntegerRandomWalk + nonlinBalance), so roughness breaks in
+# and out instead of sitting at a constant texture. Thresholds drop with intensity.
+REGIME_STEP = 0.04  # random-walk step (sd) per block
+REGIME_MIN_BLOCKS = 8  # minimum blocks per regime episode (~90 ms; clumper)
+REGIME_GATE_SMOOTH = 0.15  # per-block one-pole coefficient for the effect gates
 
 # Pitch chaos: occasional held jumps to a multiple of F0 — deterministic-chaos
 # "breaks" that give screams their wild quality (soundgen chaos_freq). High

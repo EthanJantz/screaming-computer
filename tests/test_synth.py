@@ -122,8 +122,9 @@ def _line_level(y: np.ndarray, freq_hz: float) -> float:
     return float(spec[max(0, idx - 2) : idx + 3].max())
 
 
-def test_subharmonic_sidebands_span_the_spectrum():
+def test_subharmonic_sidebands_span_the_spectrum(monkeypatch):
     """With sub_amount > 0, sideband lines appear at (n + 1/2) * F0 (SUB_RATIO=2)."""
+    monkeypatch.setitem(config.ROUGHNESS, "regimes", False)  # isolate the ingredient
     f0 = config.F0
     y_on = render(make_voice(), neutral_params(sub_amount=0.4), blocks=200)
     y_off = render(make_voice(), neutral_params(sub_amount=0.0), blocks=200)
@@ -131,8 +132,9 @@ def test_subharmonic_sidebands_span_the_spectrum():
         assert _line_level(y_on, ratio * f0) > 20.0 * _line_level(y_off, ratio * f0)
 
 
-def test_sidebands_follow_the_spectral_envelope():
+def test_sidebands_follow_the_spectral_envelope(monkeypatch):
     """A low sideband should tower over one far up the rolloff."""
+    monkeypatch.setitem(config.ROUGHNESS, "regimes", False)
     y = render(make_voice(), neutral_params(sub_amount=0.4), blocks=200)
     assert _line_level(y, 1.5 * config.F0) > 10.0 * _line_level(y, 40.5 * config.F0)
 
@@ -148,6 +150,42 @@ def test_render_meets_realtime_budget():
     elapsed = time.perf_counter() - t0
     budget = blocks * BLOCK / config.SAMPLERATE
     assert elapsed < 0.5 * budget
+
+
+def test_regime_occupancy_scales_with_intensity(monkeypatch):
+    monkeypatch.setitem(config.ROUGHNESS, "regimes", True)
+
+    def occupancy(intensity: float, blocks: int = 2000) -> float:
+        voice = make_voice()
+        params = derive_params(intensity)
+        states = []
+        for _ in range(blocks):
+            voice._apply_regimes(params)
+            states.append(voice._regime_state)
+        return float(np.mean(np.asarray(states) == 2))
+
+    assert occupancy(1.0) > 0.4  # a full scream is mostly in the rough regime
+    assert occupancy(0.1) < 0.15  # near idle it is almost always tonal
+
+
+def test_regime_gates_are_slew_limited(monkeypatch):
+    """Gates may never move more than the one-pole coefficient per block."""
+    monkeypatch.setitem(config.ROUGHNESS, "regimes", True)
+    voice = make_voice()
+    params = derive_params(0.9)
+    prev = dict(voice._gates)
+    for _ in range(500):
+        voice._apply_regimes(params)
+        for key in prev:
+            assert abs(voice._gates[key] - prev[key]) <= config.REGIME_GATE_SMOOTH
+        prev = dict(voice._gates)
+
+
+def test_regimes_off_is_passthrough(monkeypatch):
+    monkeypatch.setitem(config.ROUGHNESS, "regimes", False)
+    voice = make_voice()
+    params = derive_params(0.8)
+    assert voice._apply_regimes(params) is params
 
 
 def test_intensity_extremes():

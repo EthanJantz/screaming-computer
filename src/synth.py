@@ -14,7 +14,7 @@ layer on top of that voiced source.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -202,6 +202,14 @@ class Voice:
         self._shimmer_hold = max(1, int(config.SHIMMER_LEN_MS * samplerate / 1000.0))
         self._control_prev = {"jitter": 0.0, "shimmer": 0.0}
 
+        # Roughness-regime state: a bounded random walk, its current discrete
+        # state (0 = tonal, 1 = +subharmonics, 2 = +jitter/shimmer), a hold
+        # counter enforcing minimum episode length, and smoothed per-effect gates.
+        self._regime_walk = 0.5
+        self._regime_state = 0
+        self._regime_hold = 0
+        self._gates = {"sub": 0.0, "jitter": 0.0, "shimmer": 0.0}
+
         # Pitch-chaos state: current (glided) multiplier, the target it's gliding
         # toward, and how many blocks the target is held before re-rolling.
         self._chaos_cur = 1.0
@@ -321,6 +329,59 @@ class Voice:
             self._breath_tail = white[-self._breath_tail.size :]
         return noise * level
 
+    def _apply_regimes(self, params: SynthParams) -> SynthParams:
+        """Gate roughness episodically, like soundgen's nonlinear regimes.
+
+        A bounded random walk (reflected into [0, 1]) is re-binned each block
+        into three states — 0 = tonal, 1 = +subharmonics, 2 = +jitter/shimmer —
+        against thresholds that drop as intensity rises, soundgen's
+        ``getIntegerRandomWalk`` / ``nonlinBalance`` mechanism live. The derived
+        depths stay the ceilings; regimes switch them on and off in episodes.
+        Per-effect gates are one-pole smoothed so gating never steps the level.
+        """
+        if not config.ROUGHNESS.get("regimes"):
+            return params
+
+        w = self._regime_walk + self._rng.normal(0.0, config.REGIME_STEP)
+        w = abs(w)
+        if w > 1.0:
+            w = 2.0 - w
+        self._regime_walk = w
+
+        # Recover the 0..1 intensity from the amplitude curve (its exact inverse),
+        # so the regime balance doesn't depend on any other ingredient's toggle.
+        span = config.AMP_PEAK - config.AMP_FLOOR
+        b = ((params.amplitude - config.AMP_FLOOR) / span) if span > 0.0 else 0.0
+        b = float(np.clip(b, 0.0, 1.0)) ** (1.0 / config.AMP_CURVE)
+
+        if self._regime_hold > 0:
+            self._regime_hold -= 1
+        else:
+            q1, q2 = 1.0 - b, 1.0 - 0.7 * b
+            state = 0 if w <= q1 else (1 if w <= q2 else 2)
+            if state != self._regime_state:
+                self._regime_state = state
+                self._regime_hold = config.REGIME_MIN_BLOCKS
+
+        rough = self._regime_state == 2
+        targets = {
+            "sub": 1.0 if self._regime_state >= 1 else 0.0,
+            "jitter": 1.0 if rough else 0.0,
+            "shimmer": 1.0 if rough else 0.0,
+        }
+        for key, target in targets.items():
+            gate = self._gates[key]
+            gate += (target - gate) * config.REGIME_GATE_SMOOTH
+            # Snap tiny tails to zero so gated-off effects cost nothing.
+            self._gates[key] = 0.0 if target == 0.0 and gate < 1e-3 else gate
+
+        return replace(
+            params,
+            sub_amount=params.sub_amount * self._gates["sub"],
+            jitter_amount=params.jitter_amount * self._gates["jitter"],
+            shimmer_amount=params.shimmer_amount * self._gates["shimmer"],
+        )
+
     def _f0_multiplier(self, n: int, params: SynthParams) -> tuple[np.ndarray, float]:
         """Per-sample F0 multiplier m[k] = pitch rise * chaos glide * fast jitter.
 
@@ -340,7 +401,8 @@ class Voice:
     def render_block(self, frames: int, params: SynthParams) -> np.ndarray:
         """Render one mono block of `frames` samples as float32 in [-1, 1].
 
-        Pipeline: per-sample F0 -> voiced partials (harmonics + subharmonics) ->
+        Pipeline: regime gating -> per-sample F0 -> voiced partials (harmonics +
+        subharmonic sidebands) ->
         shimmer (amplitude wobble) -> waveshape -> overall amplitude (the swell) ->
         add constant breath floor -> hard-limit. The breath is added *after* the
         amplitude so it stays a fixed floor: at idle the breath is most of what you
@@ -349,6 +411,7 @@ class Voice:
         n = frames
         fs = self.samplerate
 
+        params = self._apply_regimes(params)
         m, central_factor = self._f0_multiplier(n, params)
 
         # Continuous absolute-time window for this block (ThinkDSP make_wave style).
