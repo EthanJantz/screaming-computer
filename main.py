@@ -18,7 +18,6 @@ import argparse
 import select
 import sys
 import termios
-import time
 import tty
 from pathlib import Path
 
@@ -124,23 +123,17 @@ def run(source_name: str = "fake", start: float = 0.0) -> None:
     state = State()
     engine = AudioEngine(state)
     engine.start()
+    source: IntensitySource = (
+        ManualIntensity(start) if source_name == "manual" else FakeTurnIntensity()
+    )
+    state.target_intensity = source.target()
     try:
         if source_name == "chess":
             _run_chess(state)
             return
-        source: IntensitySource = (
-            ManualIntensity(start) if source_name == "manual" else FakeTurnIntensity()
-        )
-        state.target_intensity = source.target()
-        if sys.stdin.isatty():
-            _drive_loop(state, source, engine)
         else:
-            print("stdin is not a TTY; running fake turns. Ctrl-C to stop.")
-            while True:
-                state.target_intensity = source.target()
-                time.sleep(_TICK)
-    except KeyboardInterrupt:
-        pass
+            _drive_loop(state, source, engine)
+            return
     finally:
         engine.stop()
         print("Stopping.")

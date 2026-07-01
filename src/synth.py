@@ -1,13 +1,17 @@
-"""Additive source-filter voice synthesizer.
+"""Additive source-filter voice synthesizer, built on ThinkDSP.
 
 Renders a controllable sustained vowel ("ahh"). It knows nothing about where its
 parameters come from — every driver, no matter the work source, ultimately just
 moves a `SynthParams`. This is the core of the screaming computer.
 
-Milestone 1 implements the voiced glottal source shaped by fixed formants, with a
-per-harmonic phase accumulator that persists across blocks (no clicks at block
-boundaries). Roughness ingredients (jitter, subharmonics, drive, breath) arrive in
-later milestones.
+The voiced source is expressed with ThinkDSP's ``Signal`` -> ``Wave`` model: each
+sound component is a ``Signal`` whose ``evaluate`` is called over a continuous
+absolute-time axis (a running integer sample counter), and the components are mixed
+as ``Wave`` data per block. Because the fundamental bends every sample (pitch rise *
+chaos * jitter), the harmonic phase is integrated from the instantaneous frequency —
+the same trick ThinkDSP's ``Chirp`` uses — so a single carried phase keeps block
+boundaries click-free. Roughness ingredients (jitter, subharmonics, drive, breath)
+layer on top of that voiced source.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any
 import numpy as np
 
 import config
+from thinkdsp import PI2, Signal, UncorrelatedGaussianNoise, Wave
 
 
 @dataclass
@@ -84,6 +89,57 @@ def derive_params(intensity: float) -> SynthParams:
     )
 
 
+class AdditiveVoice(Signal):
+    """A bank of harmonically-related sinusoids, summed internally.
+
+    This is a ThinkDSP ``Signal``, but its ``evaluate`` does the additive sum in one
+    numpy matrix op rather than composing a ``SumSignal`` of N ``Sinusoid`` objects —
+    the project's deliberate trade-off (a few dozen partials per block, in the audio
+    callback).
+
+    ThinkDSP's ``Sinusoid`` gets click-free block boundaries for free from absolute
+    time, but only while frequency is constant. Here the fundamental is modulated
+    every sample by ``f_mult`` (pitch rise * chaos * jitter), so — exactly as
+    ThinkDSP's ``Chirp`` does — we integrate the instantaneous frequency into phase
+    via ``cumsum``. Continuity across blocks then comes from ``base_phases`` (the
+    phase each partial holds at the block's first sample, carried by the ``Voice``),
+    not from the absolute ``ts`` values.
+    """
+
+    def __init__(
+        self,
+        f0: float,
+        ratios: np.ndarray,
+        amps: np.ndarray,
+        base_phases: np.ndarray,
+        f_mult: np.ndarray,
+        framerate: int,
+    ) -> None:
+        self.f0 = f0
+        self.ratios = np.asarray(ratios, dtype=np.float64)  # partial freq / f0
+        self.amps = np.asarray(amps, dtype=np.float64)
+        self.base_phases = np.asarray(base_phases, dtype=np.float64)
+        self.f_mult = f_mult  # per-sample fundamental multiplier (len == n)
+        self.framerate = framerate
+
+    def evaluate(self, ts: np.ndarray) -> np.ndarray:
+        """Sum the partials over the block whose times are ``ts``.
+
+        ``ts`` fixes the block length and spacing; the per-sample frequency comes
+        from ``f_mult``, so phase is built by integrating it rather than from ``ts``
+        directly.
+        """
+        dt = 1.0 / self.framerate
+        # Exclusive cumulative fundamental cycles: cyc_excl[k] = sum_{j<k} f0*m[j]*dt.
+        # The first sample then sits exactly at base_phases (no boundary discontinuity).
+        cyc = self.f0 * dt * np.cumsum(self.f_mult)
+        cyc_excl = cyc - self.f0 * dt * self.f_mult
+        phase = (
+            self.base_phases[:, None] + PI2 * self.ratios[:, None] * cyc_excl[None, :]
+        )
+        return (self.amps[:, None] * np.sin(phase)).sum(axis=0)
+
+
 class Voice:
     def __init__(
         self,
@@ -106,23 +162,24 @@ class Voice:
         self.harmonics = np.arange(1, h_max + 1, dtype=np.float64)
         self.freqs = self.harmonics * f0
 
-        # Per-sample phase increment per harmonic (at idle pitch; scaled per block).
-        self.omega = 2.0 * np.pi * self.freqs / samplerate
-
         # Formant gain at the idle harmonic frequencies (cached fast-path for the
         # no-pitch-shift case). Recomputed per block when the pitch rises.
         self.formant_gain = self._formant_gain(self.freqs, formants)
 
-        # Persistent phase accumulator — the key to click-free block boundaries.
-        self.phase = np.zeros_like(self.freqs)
+        # Continuous absolute-time axis: the running sample index handed to each
+        # block's ThinkDSP Wave (integer counter -> no float drift over long runs).
+        self._n = 0
 
-        # Subharmonic oscillators at F0/2 and F0/3 (period-doubled growl), each with
-        # its own persistent phase. They ride the same per-block jitter as the voice.
-        self._sub_omega = 2.0 * np.pi * np.array([f0 / 2.0, f0 / 3.0]) / samplerate
+        # Persistent phase, carried across blocks for click-free boundaries. We keep
+        # the *fundamental* phase as one float; harmonic h's phase is h * phase1
+        # (sin is 2*pi-periodic, so the mod-2*pi reduction is exact for integer h).
+        self._phase1 = 0.0
+
+        # Subharmonics at F0/2 and F0/3 (period-doubled growl). Their phase can't be
+        # derived from the mod-2*pi fundamental phase (halving it is ambiguous), so
+        # each carries its own accumulator.
+        self._sub_ratios = np.array([1.0 / 2.0, 1.0 / 3.0], dtype=np.float64)
         self._sub_phase = np.zeros(2, dtype=np.float64)
-
-        # Reusable sample-index ramp (blocksize is constant in practice).
-        self._t = np.arange(config.BLOCKSIZE, dtype=np.float64)
 
         # Fast roughness control: sample-and-hold segment lengths in samples.
         self._jitter_hold = max(1, int(config.JITTER_LEN_MS * samplerate / 1000.0))
@@ -139,7 +196,8 @@ class Voice:
         # "ahh", coherent with the voiced tone, rather than generic hiss. We design
         # a linear-phase FIR from the formant magnitude response once, then convolve
         # the noise through it per block (vectorized, carrying a tail between blocks
-        # for continuity — no per-sample Python loop in the audio callback).
+        # for continuity — no per-sample Python loop in the audio callback). The
+        # white noise itself comes from a ThinkDSP noise Signal.
         self._rng = np.random.default_rng()
         self._breath_kernel = self._design_breath_fir(samplerate, formants)
         self._breath_tail = np.zeros(self._breath_kernel.size - 1, dtype=np.float64)
@@ -248,10 +306,22 @@ class Voice:
         self._chaos_cur = end
         return seg
 
-    def _breath(self, frames: int, level: float) -> np.ndarray:
-        """Low-passed white noise, scaled by `level`, continuous across blocks."""
-        white = self._rng.standard_normal(frames)
-        # Prepend the previous block's tail so the filter sees past samples.
+    def _breath(self, frames: int, level: float, start: float) -> np.ndarray:
+        """Formant-shaped breath: ThinkDSP white noise through the FIR, continuous.
+
+        The white noise is a ThinkDSP ``UncorrelatedGaussianNoise`` Wave on the same
+        absolute-time axis as the voice. We prepend the previous block's tail so the
+        FIR sees past samples (no edge click), then carry the new tail forward.
+        """
+        white = (
+            UncorrelatedGaussianNoise(amp=1.0)
+            .make_wave(
+                duration=frames / self.samplerate,
+                start=start,
+                framerate=self.samplerate,
+            )
+            .ys
+        )
         x = np.concatenate([self._breath_tail, white])
         noise = np.convolve(x, self._breath_kernel, mode="valid")  # length == frames
         if self._breath_tail.size:
@@ -265,13 +335,15 @@ class Voice:
         -> subharmonics -> shimmer (amplitude wobble) -> waveshape -> overall
         amplitude (the swell) -> add constant breath floor -> hard-limit.
 
-        Frequency varies *within* the block now, so phase is accumulated per sample
-        (a cumulative sum of the instantaneous F0 multiplier) instead of using a
-        single per-block frequency. The breath is added *after* the amplitude so it
-        stays a fixed floor: at idle the breath is what you mostly hear; as the voice
-        swells it dominates and the breath recedes underneath.
+        Each generated component is a ThinkDSP ``Signal`` rendered into a ``Wave`` on
+        a continuous absolute-time axis (``self._n``), then mixed as Wave data. The
+        breath is added *after* the amplitude so it stays a fixed floor: at idle the
+        breath is what you mostly hear; as the voice swells it dominates and the
+        breath recedes underneath.
         """
         n = frames
+        fs = self.samplerate
+        dt = 1.0 / fs
 
         # Per-sample F0 multiplier m[k] = pitch rise * chaos glide * fast jitter.
         m = np.full(n, params.pitch_scale, dtype=np.float64)
@@ -282,35 +354,37 @@ class Voice:
         if params.jitter_amount:
             m *= 1.0 + params.jitter_amount * self._sah(n, self._jitter_hold)
 
-        # Cumulative phase factor: c_excl[k] = sum_{j<k} m[j] (so c_excl[0] == 0);
-        # total advance over the block is sum(m). This keeps phase continuous even as
-        # the instantaneous frequency changes every sample.
-        cum = np.cumsum(m)
-        c_excl = cum - m
-        total_advance = float(cum[-1])
+        # Continuous absolute-time window for this block (ThinkDSP make_wave style).
+        start = self._n / fs
+        duration = n / fs
 
-        a = self._amplitudes(params.rolloff_p, central_factor)
-
-        # phases[h, k] = phase_h + omega_h * c_excl[k]. (H x N temporary — known hot
-        # spot; fine at 44.1k/512, revisit if we see dropouts.)
-        phases = self.phase[:, None] + self.omega[:, None] * c_excl[None, :]
-        block = (a[:, None] * np.sin(phases)).sum(axis=0)
-        self.phase = (self.phase + self.omega * total_advance) % (2.0 * np.pi)
+        # Voiced harmonics: formant-shaped source-filter "ahh". harmonic h carries
+        # phase h * phase1, integrating the per-sample fundamental.
+        amps = self._amplitudes(params.rolloff_p, central_factor)
+        voiced = AdditiveVoice(
+            self.f0, self.harmonics, amps, self.harmonics * self._phase1, m, fs
+        ).make_wave(duration, start, fs)
+        block = voiced.ys
 
         # Subharmonics: F0/2 and F0/3 sines, riding the same per-sample F0.
         if params.sub_amount:
-            sub_phases = (
-                self._sub_phase[:, None] + self._sub_omega[:, None] * c_excl[None, :]
-            )
-            block += params.sub_amount * np.sin(sub_phases).sum(axis=0)
-            self._sub_phase = (self._sub_phase + self._sub_omega * total_advance) % (
-                2.0 * np.pi
-            )
+            sub = AdditiveVoice(
+                self.f0, self._sub_ratios, np.ones(2), self._sub_phase, m, fs
+            ).make_wave(duration, start, fs)
+            block = block + params.sub_amount * sub.ys
+
+        # Advance carried phases by this block's fundamental cycle count.
+        block_cycles = self.f0 * dt * float(m.sum())
+        self._phase1 = (self._phase1 + PI2 * block_cycles) % PI2
+        self._sub_phase = (
+            self._sub_phase + PI2 * self._sub_ratios * block_cycles
+        ) % PI2
 
         # Shimmer: per-sample amplitude wobble on the voiced source.
         if params.shimmer_amount:
-            block *= 1.0 + params.shimmer_amount * self._shimmer_control(
-                n, self._shimmer_hold
+            block = block * (
+                1.0
+                + params.shimmer_amount * self._shimmer_control(n, self._shimmer_hold)
             )
 
         # Drive: tanh waveshaping for high-harmonic grit. Crossfade dry->wet by
@@ -318,9 +392,13 @@ class Voice:
         # /tanh(drive) normalization keeps unit-level peaks roughly unit).
         if params.drive_mix > 0.0:
             wet = np.tanh(params.drive * block) / np.tanh(params.drive)
-            block += params.drive_mix * (wet - block)
+            block = block + params.drive_mix * (wet - block)
 
-        block *= params.amplitude  # the swell applies to the voice only
-        block += self._breath(n, params.breath_level)  # constant idle floor
-        np.clip(block, -1.0, 1.0, out=block)
-        return block.astype(np.float32)
+        block = block * params.amplitude  # the swell applies to the voice only
+        block = block + self._breath(n, params.breath_level, start)  # constant floor
+
+        # Hand the mixed block back as a ThinkDSP Wave, then hard-limit and emit.
+        out = Wave(block, framerate=fs)
+        np.clip(out.ys, -1.0, 1.0, out=out.ys)
+        self._n += n
+        return out.ys.astype(np.float32)
