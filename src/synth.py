@@ -5,12 +5,10 @@ parameters come from — every driver, no matter the work source, ultimately jus
 moves a `SynthParams`. This is the core of the screaming computer.
 
 The voiced source is expressed with ThinkDSP's ``Signal`` -> ``Wave`` model: each
-sound component is a ``Signal`` whose ``evaluate`` is called over a continuous
-absolute-time axis (a running integer sample counter), and the components are mixed
-as ``Wave`` data per block. Because the fundamental bends every sample (pitch rise *
-chaos * jitter), the harmonic phase is integrated from the instantaneous frequency —
-the same trick ThinkDSP's ``Chirp`` uses — so a single carried phase keeps block
-boundaries click-free. Roughness ingredients (jitter, subharmonics, drive, breath)
+sound component is a ``Signal`` rendered over a continuous absolute-time axis (a
+running integer sample counter) and mixed as ``Wave`` data per block. See
+``AdditiveVoice`` for how phase stays continuous while the fundamental bends every
+sample. Roughness ingredients (jitter, shimmer, subharmonics, chaos, drive, breath)
 layer on top of that voiced source.
 """
 
@@ -145,12 +143,7 @@ class AdditiveVoice(Signal):
         self.framerate = framerate
 
     def evaluate(self, ts: np.ndarray) -> np.ndarray:
-        """Sum the partials over the block whose times are ``ts``.
-
-        ``ts`` fixes the block length and spacing; the per-sample frequency comes
-        from ``f_mult``, so phase is built by integrating it rather than from ``ts``
-        directly.
-        """
+        """Sum the partials over the block whose times are ``ts``."""
         dt = 1.0 / self.framerate
         # Exclusive cumulative fundamental cycles: cyc_excl[k] = sum_{j<k} f0*m[j]*dt.
         # The first sample then sits exactly at base_phases (no boundary discontinuity).
@@ -308,31 +301,33 @@ class Voice:
             self._breath_tail = white[-self._breath_tail.size :]
         return noise * level
 
-    def render_block(self, frames: int, params: SynthParams) -> np.ndarray:
-        """Render one mono block of `frames` samples as float32 in [-1, 1].
+    def _f0_multiplier(self, n: int, params: SynthParams) -> tuple[np.ndarray, float]:
+        """Per-sample F0 multiplier m[k] = pitch rise * chaos glide * fast jitter.
 
-        Order: build per-sample F0 (pitch rise * chaos * jitter) -> voiced partials
-        (harmonics + subharmonics) -> shimmer (amplitude wobble) -> waveshape ->
-        overall amplitude (the swell) -> add constant breath floor -> hard-limit.
-
-        Each generated component is a ThinkDSP ``Signal`` rendered into a ``Wave`` on
-        a continuous absolute-time axis (``self._n``), then mixed as Wave data. The
-        breath is added *after* the amplitude so it stays a fixed floor: at idle the
-        breath is what you mostly hear; as the voice swells it dominates and the
-        breath recedes underneath.
+        Also returns the central (pre-jitter) factor, which drives the block's
+        formant re-evaluation.
         """
-        n = frames
-        fs = self.samplerate
-        dt = 1.0 / fs
-
-        # Per-sample F0 multiplier m[k] = pitch rise * chaos glide * fast jitter.
         m = np.full(n, params.pitch_scale, dtype=np.float64)
         if params.chaos_amount:
             m *= self._chaos_segment(n, params.chaos_amount)
-        # Central (pre-jitter) factor drives the formant re-evaluation for the block.
         central_factor = float(m.mean())
         if params.jitter_amount:
             m *= 1.0 + params.jitter_amount * self._sah(n, self._jitter_hold)
+        return m, central_factor
+
+    def render_block(self, frames: int, params: SynthParams) -> np.ndarray:
+        """Render one mono block of `frames` samples as float32 in [-1, 1].
+
+        Pipeline: per-sample F0 -> voiced partials (harmonics + subharmonics) ->
+        shimmer (amplitude wobble) -> waveshape -> overall amplitude (the swell) ->
+        add constant breath floor -> hard-limit. The breath is added *after* the
+        amplitude so it stays a fixed floor: at idle the breath is most of what you
+        hear; as the voice swells it dominates and the breath recedes underneath.
+        """
+        n = frames
+        fs = self.samplerate
+
+        m, central_factor = self._f0_multiplier(n, params)
 
         # Continuous absolute-time window for this block (ThinkDSP make_wave style).
         start = self._n / fs
@@ -352,7 +347,7 @@ class Voice:
         block = voiced.ys
 
         # Advance the carried phases by this block's fundamental cycle count.
-        block_cycles = self.f0 * dt * float(m.sum())
+        block_cycles = self.f0 * float(m.sum()) / fs
         self._phases = (self._phases + PI2 * self._ratios * block_cycles) % PI2
 
         # Shimmer: per-sample amplitude wobble on the voiced source.
