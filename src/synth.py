@@ -30,7 +30,7 @@ class SynthParams:
     pitch_scale: float  # multiplies F0 (rises with intensity); 1.0 == idle pitch
     rolloff_p: float  # source amplitude rolloff exponent (lower = brighter)
     breath_level: float  # mixed-in filtered-noise breath
-    jitter_amount: float  # depth of fast sample-and-hold F0 wobble (hoarseness)
+    jitter_amount: float  # sd of the fast F0 wobble, in semitones (hoarseness)
     shimmer_amount: float  # depth of per-sample amplitude wobble (roughness)
     sub_amount: float  # level of F0/2 and F0/3 subharmonic oscillators (growl)
     chaos_amount: float  # likelihood/strength of held pitch-jump "breaks"
@@ -64,7 +64,7 @@ def derive_params(intensity: float) -> SynthParams:
             else config.P_IDLE
         ),
         breath_level=config.BREATH_IDLE,  # constant floor for v1
-        jitter_amount=config.JITTER_MAX * i if on("jitter") else 0.0,
+        jitter_amount=config.JITTER_MAX_ST * i if on("jitter") else 0.0,
         shimmer_amount=config.SHIMMER_MAX * i if on("shimmer") else 0.0,
         # Subharmonics kick in past mid-intensity; chaos (pitch breaks) only at
         # high intensity.
@@ -188,10 +188,11 @@ class Voice:
         self._ratios = np.concatenate([self._sub_ratios, self.harmonics])
         self._phases = np.zeros(self._ratios.size, dtype=np.float64)
 
-        # Fast roughness control: sample-and-hold segment lengths in samples.
+        # Fast roughness controls: anchor segment lengths in samples, plus each
+        # control's last value, carried across blocks so the controls never step.
         self._jitter_hold = max(1, int(config.JITTER_LEN_MS * samplerate / 1000.0))
         self._shimmer_hold = max(1, int(config.SHIMMER_LEN_MS * samplerate / 1000.0))
-        self._shimmer_prev = 0.0  # carries shimmer env across blocks (no click)
+        self._control_prev = {"jitter": 0.0, "shimmer": 0.0}
 
         # Pitch-chaos state: current (glided) multiplier, the target it's gliding
         # toward, and how many blocks the target is held before re-rolling.
@@ -231,29 +232,22 @@ class Voice:
             a = a / total
         return a
 
-    def _sah(self, n: int, hold: int) -> np.ndarray:
-        """Sample-and-hold random control in [-1, 1], piecewise-constant.
+    def _smooth_control(self, n: int, hold: int, name: str) -> np.ndarray:
+        """Linearly-interpolated random control, continuous across blocks.
 
-        Steps are fine for *frequency* (jitter): phase stays continuous through a
-        frequency step, so it warbles rather than clicks.
-        """
-        reps = n // hold + 1
-        vals = self._rng.uniform(-1.0, 1.0, size=reps)
-        return np.repeat(vals, hold)[:n]
-
-    def _shimmer_control(self, n: int, hold: int) -> np.ndarray:
-        """Linearly-interpolated random control in [-1, 1], continuous across blocks.
-
-        Used for *amplitude* (shimmer): a sudden amplitude step would click, so we
-        interpolate between control points and carry the last value into the next
-        block.
+        Random anchors every ``hold`` samples — unit-normal for jitter (soundgen's
+        rnorm), uniform [-1, 1] for shimmer — joined by linear interpolation, with
+        the last value carried into the next block so the control never steps.
         """
         npts = n // hold + 2
-        pts = self._rng.uniform(-1.0, 1.0, size=npts)
-        pts[0] = self._shimmer_prev
+        if name == "jitter":
+            pts = self._rng.normal(0.0, 1.0, size=npts)
+        else:
+            pts = self._rng.uniform(-1.0, 1.0, size=npts)
+        pts[0] = self._control_prev[name]
         xs = np.arange(npts) * hold
         env = np.interp(np.arange(n), xs, pts)
-        self._shimmer_prev = float(env[-1])
+        self._control_prev[name] = float(env[-1])
         return env
 
     def _chaos_segment(self, n: int, amount: float) -> np.ndarray:
@@ -312,7 +306,9 @@ class Voice:
             m *= self._chaos_segment(n, params.chaos_amount)
         central_factor = float(m.mean())
         if params.jitter_amount:
-            m *= 1.0 + params.jitter_amount * self._sah(n, self._jitter_hold)
+            # Multiplicative in semitone space (soundgen: 2^(rnorm(sd=dep)/12)).
+            z = self._smooth_control(n, self._jitter_hold, "jitter")
+            m *= 2.0 ** (params.jitter_amount * z / 12.0)
         return m, central_factor
 
     def render_block(self, frames: int, params: SynthParams) -> np.ndarray:
@@ -352,10 +348,8 @@ class Voice:
 
         # Shimmer: per-sample amplitude wobble on the voiced source.
         if params.shimmer_amount:
-            block = block * (
-                1.0
-                + params.shimmer_amount * self._shimmer_control(n, self._shimmer_hold)
-            )
+            shimmer = self._smooth_control(n, self._shimmer_hold, "shimmer")
+            block = block * (1.0 + params.shimmer_amount * shimmer)
 
         # Drive: tanh waveshaping for high-harmonic grit. Crossfade dry->wet by
         # intensity so it's a no-op at idle and fades in with no level jump (the

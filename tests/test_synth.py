@@ -83,6 +83,35 @@ def test_roughness_toggles_gate_params(monkeypatch):
     assert derive_params(1.0).rolloff_p == config.P_IDLE
 
 
+def test_jitter_control_continuous_across_blocks():
+    """The F0 wobble must not step at block seams (soundgen-style smooth jitter)."""
+    voice = make_voice()
+    params = neutral_params(jitter_amount=config.JITTER_MAX_ST)
+    m1, _ = voice._f0_multiplier(BLOCK, params)
+    m2, _ = voice._f0_multiplier(BLOCK, params)
+    steps = np.abs(np.diff(np.log2(np.concatenate([m1, m2]))))
+    seam = steps[BLOCK - 1]
+    interior = np.delete(steps, BLOCK - 1)
+    # A discontinuous control would jump by a whole anchor at the seam, ~hold
+    # times larger than any interpolated per-sample step.
+    assert seam <= interior.max() * 2.0
+
+
+def test_jitter_is_semitone_scaled_and_symmetric():
+    """log2(m) should be zero-mean with sd tracking the semitone depth.
+
+    Linear interpolation of unit-normal anchors has variance 2/3, so the
+    expected sd is depth * sqrt(2/3) ~= 0.816 * depth semitones.
+    """
+    voice = make_voice()
+    depth = 2.0
+    params = neutral_params(jitter_amount=depth)
+    ms = [voice._f0_multiplier(BLOCK, params)[0] for _ in range(500)]
+    log_st = np.log2(np.concatenate(ms)) * 12.0  # deviation in semitones
+    assert abs(log_st.mean()) < 0.1
+    assert depth * 0.7 < log_st.std() < depth * 0.95
+
+
 def test_intensity_extremes():
     idle, full = derive_params(0.0), derive_params(1.0)
     assert idle.amplitude == pytest.approx(config.AMP_FLOOR)

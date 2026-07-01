@@ -47,10 +47,11 @@ ROUGHNESS = {
     "brightening": True,
 }
 
-# Jitter: fast sample-and-hold F0 wobble (hoarseness). Deep + fast like soundgen's
+# Jitter: fast random F0 wobble (hoarseness). Deep + fast like soundgen's
 # jitterDep/jitterLen — slow/shallow jitter reads as vibrato instead of roughness.
-JITTER_MAX = 0.08  # fractional F0 wobble at full intensity (~1.3 semitones)
-JITTER_LEN_MS = 2.0  # sample-and-hold segment length (soundgen jitterLen)
+# Normal anchors in semitone space, like soundgen's 2^(rnorm(sd=jitterDep)/12).
+JITTER_MAX_ST = 1.4  # sd of the F0 wobble at full intensity, in semitones
+JITTER_LEN_MS = 2.0  # anchor segment length (soundgen jitterLen)
 
 # Shimmer: per-sample random amplitude perturbation (soundgen shimmerDep).
 SHIMMER_MAX = 0.18  # fractional amplitude wobble at full intensity
