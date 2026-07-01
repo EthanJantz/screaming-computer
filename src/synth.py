@@ -17,7 +17,6 @@ layer on top of that voiced source.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -76,6 +75,40 @@ def derive_params(intensity: float) -> SynthParams:
         drive=1.0 + config.DRIVE_MAX * i if on("drive") else 1.0,
         drive_mix=i if on("drive") else 0.0,  # dry at idle, full wet at peak
     )
+
+
+def _formant_gain(
+    freqs: np.ndarray, formants: list[tuple[float, float]]
+) -> np.ndarray:
+    """Product of resonant formant responses g_i(f) (spec Section 5.1)."""
+    gain = np.ones_like(freqs)
+    for fc, bandwidth in formants:
+        q = fc / bandwidth
+        x = freqs / fc
+        gain *= 1.0 / np.sqrt((1.0 - x**2) ** 2 + (x / q) ** 2)
+    return gain
+
+
+def _design_breath_fir(
+    samplerate: int, formants: list[tuple[float, float]], length: int = 256
+) -> np.ndarray:
+    """Linear-phase FIR whose magnitude ≈ formant envelope * gentle air-rolloff.
+
+    Convolving white noise with this yields breath colored like the vowel. The
+    kernel is normalized to unit energy so `breath_level` sets the breath's RMS
+    directly.
+    """
+    freqs = np.fft.rfftfreq(length, d=1.0 / samplerate)
+    mag = _formant_gain(freqs, formants)
+    # Gentle high-frequency rolloff so it reads as airy breath, not bright hiss.
+    mag = mag / np.sqrt(1.0 + (freqs / config.BREATH_CUTOFF) ** 2)
+    # Zero-phase impulse response -> shift to the centre + window -> linear phase.
+    h = np.fft.fftshift(np.fft.irfft(mag, n=length))
+    h *= np.hanning(length)
+    norm = np.sqrt(np.sum(h**2))
+    if norm > 0.0:
+        h = h / norm
+    return h
 
 
 class AdditiveVoice(Signal):
@@ -138,11 +171,7 @@ class Voice:
     ) -> None:
         self.samplerate = samplerate
         self.f0 = f0
-        formants: list[tuple[Any, Any]] = (
-            formants if formants is not None else config.FORMANTS
-        )
-
-        self._formants = formants
+        self._formants = formants if formants is not None else config.FORMANTS
         self._nyquist = samplerate / 2.0
 
         # Harmonics 1..H up to (but not including) Nyquist at the *idle* pitch. As
@@ -153,7 +182,7 @@ class Voice:
 
         # Formant gain at the idle harmonic frequencies (cached fast-path for the
         # no-pitch-shift case). Recomputed per block when the pitch rises.
-        self.formant_gain = self._formant_gain(self.freqs, formants)
+        self.formant_gain = _formant_gain(self.freqs, self._formants)
 
         # Continuous absolute-time axis: the running sample index handed to each
         # block's ThinkDSP Wave (integer counter -> no float drift over long runs).
@@ -184,42 +213,8 @@ class Voice:
         # for continuity — no per-sample Python loop in the audio callback). The
         # white noise itself comes from a ThinkDSP noise Signal.
         self._rng = np.random.default_rng()
-        self._breath_kernel = self._design_breath_fir(samplerate, formants)
+        self._breath_kernel = _design_breath_fir(samplerate, self._formants)
         self._breath_tail = np.zeros(self._breath_kernel.size - 1, dtype=np.float64)
-
-    @classmethod
-    def _design_breath_fir(
-        cls, samplerate: int, formants: list[tuple[float, float]], length: int = 256
-    ) -> np.ndarray:
-        """Linear-phase FIR whose magnitude ≈ formant envelope * gentle air-rolloff.
-
-        Convolving white noise with this yields breath colored like the vowel. The
-        kernel is normalized to unit energy so `breath_level` sets the breath's RMS
-        directly.
-        """
-        freqs = np.fft.rfftfreq(length, d=1.0 / samplerate)
-        mag = cls._formant_gain(freqs, formants)
-        # Gentle high-frequency rolloff so it reads as airy breath, not bright hiss.
-        mag = mag / np.sqrt(1.0 + (freqs / config.BREATH_CUTOFF) ** 2)
-        # Zero-phase impulse response -> shift to the centre + window -> linear phase.
-        h = np.fft.fftshift(np.fft.irfft(mag, n=length))
-        h *= np.hanning(length)
-        norm = np.sqrt(np.sum(h**2))
-        if norm > 0.0:
-            h = h / norm
-        return h
-
-    @staticmethod
-    def _formant_gain(
-        freqs: np.ndarray, formants: list[tuple[float, float]]
-    ) -> np.ndarray:
-        """Product of resonant formant responses g_i(f) (spec Section 5.1)."""
-        gain = np.ones_like(freqs)
-        for fc, bandwidth in formants:
-            q = fc / bandwidth
-            x = freqs / fc
-            gain *= 1.0 / np.sqrt((1.0 - x**2) ** 2 + (x / q) ** 2)
-        return gain
 
     def _amplitudes(self, rolloff_p: float, f0_factor: float) -> np.ndarray:
         """Harmonic amplitudes: source rolloff * (fixed) formant gain, normalized.
@@ -236,7 +231,7 @@ class Voice:
             a = a_source * self.formant_gain
         else:
             freqs = self.freqs * f0_factor
-            gain = self._formant_gain(freqs, self._formants)
+            gain = _formant_gain(freqs, self._formants)
             a = a_source * gain * (freqs < self._nyquist)
         total = a.sum()
         if total > 0.0:
