@@ -75,9 +75,7 @@ def derive_params(intensity: float) -> SynthParams:
     )
 
 
-def _formant_gain(
-    freqs: np.ndarray, formants: list[tuple[float, float]]
-) -> np.ndarray:
+def _formant_gain(freqs: np.ndarray, formants: list[tuple[int, int]]) -> np.ndarray:
     """Product of resonant formant responses g_i(f) (spec Section 5.1)."""
     gain = np.ones_like(freqs)
     for fc, bandwidth in formants:
@@ -88,7 +86,7 @@ def _formant_gain(
 
 
 def _design_breath_fir(
-    samplerate: int, formants: list[tuple[float, float]], length: int = 256
+    samplerate: int, formants: list[tuple[int, int]], length: int = 256
 ) -> np.ndarray:
     """Linear-phase FIR whose magnitude ≈ formant envelope * gentle air-rolloff.
 
@@ -164,7 +162,9 @@ class Voice:
     ) -> None:
         self.samplerate = samplerate
         self.f0 = f0
-        self._formants = formants if formants is not None else config.FORMANTS
+        self._formants: list[tuple[int, int]] = (
+            formants if formants is not None else config.FORMANTS
+        )
         self._nyquist = samplerate / 2.0
 
         # Harmonics 1..H up to (but not including) Nyquist at the *idle* pitch. As
