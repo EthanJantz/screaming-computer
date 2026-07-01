@@ -159,16 +159,12 @@ class Voice:
         # block's ThinkDSP Wave (integer counter -> no float drift over long runs).
         self._n = 0
 
-        # Persistent phase, carried across blocks for click-free boundaries. We keep
-        # the *fundamental* phase as one float; harmonic h's phase is h * phase1
-        # (sin is 2*pi-periodic, so the mod-2*pi reduction is exact for integer h).
-        self._phase1 = 0.0
-
-        # Subharmonics at F0/2 and F0/3 (period-doubled growl). Their phase can't be
-        # derived from the mod-2*pi fundamental phase (halving it is ambiguous), so
-        # each carries its own accumulator.
+        # One bank of partials: subharmonics at F0/2 and F0/3 (period-doubled
+        # growl) first, then the harmonics. Each partial's phase is carried across
+        # blocks for click-free boundaries.
         self._sub_ratios = np.array([1.0 / 2.0, 1.0 / 3.0], dtype=np.float64)
-        self._sub_phase = np.zeros(2, dtype=np.float64)
+        self._ratios = np.concatenate([self._sub_ratios, self.harmonics])
+        self._phases = np.zeros(self._ratios.size, dtype=np.float64)
 
         # Fast roughness control: sample-and-hold segment lengths in samples.
         self._jitter_hold = max(1, int(config.JITTER_LEN_MS * samplerate / 1000.0))
@@ -320,9 +316,9 @@ class Voice:
     def render_block(self, frames: int, params: SynthParams) -> np.ndarray:
         """Render one mono block of `frames` samples as float32 in [-1, 1].
 
-        Order: build per-sample F0 (pitch rise * chaos * jitter) -> voiced harmonics
-        -> subharmonics -> shimmer (amplitude wobble) -> waveshape -> overall
-        amplitude (the swell) -> add constant breath floor -> hard-limit.
+        Order: build per-sample F0 (pitch rise * chaos * jitter) -> voiced partials
+        (harmonics + subharmonics) -> shimmer (amplitude wobble) -> waveshape ->
+        overall amplitude (the swell) -> add constant breath floor -> hard-limit.
 
         Each generated component is a ThinkDSP ``Signal`` rendered into a ``Wave`` on
         a continuous absolute-time axis (``self._n``), then mixed as Wave data. The
@@ -347,27 +343,22 @@ class Voice:
         start = self._n / fs
         duration = n / fs
 
-        # Voiced harmonics: formant-shaped source-filter "ahh". harmonic h carries
-        # phase h * phase1, integrating the per-sample fundamental.
-        amps = self._amplitudes(params.rolloff_p, central_factor)
+        # Voiced partials: the formant-shaped source-filter "ahh" plus the
+        # subharmonics, summed in one bank riding the same per-sample F0.
+        amps = np.concatenate(
+            [
+                np.full(self._sub_ratios.size, params.sub_amount),
+                self._amplitudes(params.rolloff_p, central_factor),
+            ]
+        )
         voiced = AdditiveVoice(
-            self.f0, self.harmonics, amps, self.harmonics * self._phase1, m, fs
+            self.f0, self._ratios, amps, self._phases, m, fs
         ).make_wave(duration, start, fs)
         block = voiced.ys
 
-        # Subharmonics: F0/2 and F0/3 sines, riding the same per-sample F0.
-        if params.sub_amount:
-            sub = AdditiveVoice(
-                self.f0, self._sub_ratios, np.ones(2), self._sub_phase, m, fs
-            ).make_wave(duration, start, fs)
-            block = block + params.sub_amount * sub.ys
-
-        # Advance carried phases by this block's fundamental cycle count.
+        # Advance the carried phases by this block's fundamental cycle count.
         block_cycles = self.f0 * dt * float(m.sum())
-        self._phase1 = (self._phase1 + PI2 * block_cycles) % PI2
-        self._sub_phase = (
-            self._sub_phase + PI2 * self._sub_ratios * block_cycles
-        ) % PI2
+        self._phases = (self._phases + PI2 * self._ratios * block_cycles) % PI2
 
         # Shimmer: per-sample amplitude wobble on the voiced source.
         if params.shimmer_amount:
