@@ -41,6 +41,15 @@ class SynthParams:
     drive_mix: float  # dry->wet crossfade for the waveshaper (0..1)
 
 
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
+def _ramp(i: float, threshold: float) -> float:
+    """Clamped 0->1 ramp: 0 at or below ``threshold``, 1 at full intensity."""
+    return min(max((i - threshold) / (1.0 - threshold), 0.0), 1.0)
+
+
 def derive_params(intensity: float) -> SynthParams:
     """Map a smoothed 0..1 intensity to synth parameters.
 
@@ -48,44 +57,24 @@ def derive_params(intensity: float) -> SynthParams:
     derives to a no-op value (e.g. 0), so the toggle never reaches the renderer.
     """
     i = float(np.clip(intensity, 0.0, 1.0))
-    # amplitude can end up larger than 1?
-    amplitude = (
-        config.AMP_FLOOR + (config.AMP_PEAK - config.AMP_FLOOR) * i**config.AMP_CURVE
-    )
-    pitch_scale = 2.0 ** (config.F0_RISE_SEMITONES * i / 12.0)
-    if config.ROUGHNESS.get("brightening"):
-        rolloff_p = config.P_IDLE - (config.P_IDLE - config.P_BRIGHT) * i
-    else:
-        rolloff_p = config.P_IDLE  # constant timbre, no brightening
-    breath_level = config.BREATH_IDLE  # constant floor for v1
-    jitter_amount = config.JITTER_MAX * i if config.ROUGHNESS.get("jitter") else 0.0
-    shimmer_amount = config.SHIMMER_MAX * i if config.ROUGHNESS.get("shimmer") else 0.0
-    # Subharmonics kick in only past mid-intensity.
-    sub_ramp = min(max((i - 0.5) / 0.5, 0.0), 1.0)
-    sub_amount = (
-        config.SUB_MAX * sub_ramp if config.ROUGHNESS.get("subharmonics") else 0.0
-    )
-    # Chaos (pitch breaks) ramps in only at high intensity.
-    chaos_ramp = min(
-        max((i - config.CHAOS_THRESH) / (1.0 - config.CHAOS_THRESH), 0.0), 1.0
-    )
-    chaos_amount = chaos_ramp if config.ROUGHNESS.get("chaos") else 0.0
-    if config.ROUGHNESS.get("drive"):
-        drive = 1.0 + config.DRIVE_MAX * i
-        drive_mix = i  # dry at idle, full wet at peak
-    else:
-        drive, drive_mix = 1.0, 0.0
+    on = config.ROUGHNESS.get
     return SynthParams(
-        amplitude=amplitude,
-        pitch_scale=pitch_scale,
-        rolloff_p=rolloff_p,
-        breath_level=breath_level,
-        jitter_amount=jitter_amount,
-        shimmer_amount=shimmer_amount,
-        sub_amount=sub_amount,
-        chaos_amount=chaos_amount,
-        drive=drive,
-        drive_mix=drive_mix,
+        amplitude=_lerp(config.AMP_FLOOR, config.AMP_PEAK, i**config.AMP_CURVE),
+        pitch_scale=2.0 ** (config.F0_RISE_SEMITONES * i / 12.0),
+        rolloff_p=(
+            _lerp(config.P_IDLE, config.P_BRIGHT, i)
+            if on("brightening")
+            else config.P_IDLE
+        ),
+        breath_level=config.BREATH_IDLE,  # constant floor for v1
+        jitter_amount=config.JITTER_MAX * i if on("jitter") else 0.0,
+        shimmer_amount=config.SHIMMER_MAX * i if on("shimmer") else 0.0,
+        # Subharmonics kick in past mid-intensity; chaos (pitch breaks) only at
+        # high intensity.
+        sub_amount=config.SUB_MAX * _ramp(i, 0.5) if on("subharmonics") else 0.0,
+        chaos_amount=_ramp(i, config.CHAOS_THRESH) if on("chaos") else 0.0,
+        drive=1.0 + config.DRIVE_MAX * i if on("drive") else 1.0,
+        drive_mix=i if on("drive") else 0.0,  # dry at idle, full wet at peak
     )
 
 
