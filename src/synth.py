@@ -32,7 +32,7 @@ class SynthParams:
     breath_level: float  # mixed-in filtered-noise breath
     jitter_amount: float  # sd of the fast F0 wobble, in semitones (hoarseness)
     shimmer_amount: float  # depth of per-sample amplitude wobble (roughness)
-    sub_amount: float  # level of F0/2 and F0/3 subharmonic oscillators (growl)
+    sub_amount: float  # level of the subharmonic sideband partials (growl)
     chaos_amount: float  # likelihood/strength of held pitch-jump "breaks"
     drive: float  # tanh waveshaper sharpness (grit); 1.0 == no shaping
     drive_mix: float  # dry->wet crossfade for the waveshaper (0..1)
@@ -171,22 +171,30 @@ class Voice:
         # the pitch rises these slide up; harmonics that cross Nyquist get masked.
         h_max = int((self._nyquist - 1e-6) // f0)
         self.harmonics = np.arange(1, h_max + 1, dtype=np.float64)
-        self.freqs = self.harmonics * f0
 
-        # Formant gain at the idle harmonic frequencies (cached fast-path for the
-        # no-pitch-shift case). Recomputed per block when the pitch rises.
-        self.formant_gain = _formant_gain(self.freqs, self._formants)
+        # One bank of partials: subharmonic sidebands between the harmonics
+        # (soundgen addSubh) first, then the harmonics themselves. For period
+        # multiplier G, sidebands sit at ratios n + s/G in every harmonic gap
+        # (including 1/G below the fundamental), putting period-G growl energy
+        # across the whole spectrum. Each partial's phase is carried across
+        # blocks for click-free boundaries.
+        g = config.SUB_RATIO
+        offsets = np.arange(1, g, dtype=np.float64) / g
+        sub = (np.arange(0, h_max)[:, None] + offsets[None, :]).ravel()
+        self._sub_ratios = sub[sub * f0 < self._nyquist]
+        self._ratios = np.concatenate([self._sub_ratios, self.harmonics])
+        self._phases = np.zeros(self._ratios.size, dtype=np.float64)
+        # Each sideband's distance to its nearest harmonic, as a fraction of F0.
+        frac = self._sub_ratios % 1.0
+        self._sub_dist_frac = np.minimum(frac, 1.0 - frac)
+
+        # Formant gain at the idle-pitch partial frequencies (cached fast-path for
+        # the no-pitch-shift case). Recomputed per block when the pitch rises.
+        self.formant_gain = _formant_gain(self._ratios * f0, self._formants)
 
         # Continuous absolute-time axis: the running sample index handed to each
         # block's ThinkDSP Wave (integer counter -> no float drift over long runs).
         self._n = 0
-
-        # One bank of partials: subharmonics at F0/2 and F0/3 (period-doubled
-        # growl) first, then the harmonics. Each partial's phase is carried across
-        # blocks for click-free boundaries.
-        self._sub_ratios = np.array([1.0 / 2.0, 1.0 / 3.0], dtype=np.float64)
-        self._ratios = np.concatenate([self._sub_ratios, self.harmonics])
-        self._phases = np.zeros(self._ratios.size, dtype=np.float64)
 
         # Fast roughness controls: anchor segment lengths in samples, plus each
         # control's last value, carried across blocks so the controls never step.
@@ -210,27 +218,45 @@ class Voice:
         self._breath_kernel = _design_breath_fir(samplerate, self._formants)
         self._breath_tail = np.zeros(self._breath_kernel.size - 1, dtype=np.float64)
 
-    def _amplitudes(self, rolloff_p: float, f0_factor: float) -> np.ndarray:
-        """Harmonic amplitudes: source rolloff * (fixed) formant gain, normalized.
+    def _envelope(self, rolloff_p: float, f0_factor: float) -> np.ndarray:
+        """Source rolloff * formant gain at every partial, Nyquist-masked.
 
-        ``f0_factor`` slides the harmonics up/down under the *stationary* formants;
+        ``f0_factor`` slides the partials up/down under the *stationary* formants;
         the formant gain is re-evaluated at the shifted frequencies (source-filter
-        synthesis), and harmonics above Nyquist are dropped to avoid aliasing.
-
-        Normalizing so the amplitudes sum to 1 bounds the summed sine block to
-        [-1, 1] before the overall amplitude is applied.
+        synthesis), and partials above Nyquist are dropped to avoid aliasing. The
+        rolloff ratio is clamped at 1 so sub-fundamental sidebands take the
+        fundamental's source level instead of exceeding it.
         """
-        a_source = 1.0 / self.harmonics**rolloff_p
+        a_source = np.maximum(self._ratios, 1.0) ** -rolloff_p
         if f0_factor == 1.0:
-            a = a_source * self.formant_gain
-        else:
-            freqs = self.freqs * f0_factor
-            gain = _formant_gain(freqs, self._formants)
-            a = a_source * gain * (freqs < self._nyquist)
-        total = a.sum()
+            return a_source * self.formant_gain
+        freqs = self._ratios * self.f0 * f0_factor
+        gain = _formant_gain(freqs, self._formants)
+        return a_source * gain * (freqs < self._nyquist)
+
+    def _amplitudes(
+        self, rolloff_p: float, f0_factor: float, sub_amount: float
+    ) -> np.ndarray:
+        """Amplitudes for the full partial bank at the current pitch.
+
+        Harmonic amplitudes are normalized to sum to 1, bounding the voiced sum
+        to [-1, 1] before the overall amplitude is applied. Sidebands ride on
+        top: the same envelope level, scaled by ``sub_amount`` and a Gaussian
+        falloff with Hz-distance from the nearest harmonic (soundgen's subWidth
+        weighting), so they follow the vowel's spectral shape.
+        """
+        amps = self._envelope(rolloff_p, f0_factor)
+        nsub = self._sub_ratios.size
+        total = amps[nsub:].sum()
         if total > 0.0:
-            a = a / total
-        return a
+            amps = amps / total
+        if sub_amount > 0.0:
+            dist_hz = self._sub_dist_frac * self.f0 * f0_factor
+            weight = np.exp(-0.5 * (dist_hz / config.SUB_WIDTH_HZ) ** 2)
+            amps[:nsub] *= sub_amount * weight
+        else:
+            amps[:nsub] = 0.0
+        return amps
 
     def _smooth_control(self, n: int, hold: int, name: str) -> np.ndarray:
         """Linearly-interpolated random control, continuous across blocks.
@@ -330,15 +356,13 @@ class Voice:
         duration = n / fs
 
         # Voiced partials: the formant-shaped source-filter "ahh" plus the
-        # subharmonics, summed in one bank riding the same per-sample F0.
-        amps = np.concatenate(
-            [
-                np.full(self._sub_ratios.size, params.sub_amount),
-                self._amplitudes(params.rolloff_p, central_factor),
-            ]
-        )
+        # subharmonic sidebands, summed in one bank riding the same per-sample F0.
+        # Zero-amplitude rows (e.g. all sidebands when sub_amount == 0) are sliced
+        # out before the matrix op so the tonal voice doesn't pay for them.
+        amps = self._amplitudes(params.rolloff_p, central_factor, params.sub_amount)
+        active = amps > 0.0
         voiced = AdditiveVoice(
-            self.f0, self._ratios, amps, self._phases, m, fs
+            self.f0, self._ratios[active], amps[active], self._phases[active], m, fs
         ).make_wave(duration, start, fs)
         block = voiced.ys
 

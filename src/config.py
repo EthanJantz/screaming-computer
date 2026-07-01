@@ -57,7 +57,14 @@ JITTER_LEN_MS = 2.0  # anchor segment length (soundgen jitterLen)
 SHIMMER_MAX = 0.18  # fractional amplitude wobble at full intensity
 SHIMMER_LEN_MS = 3.0  # control segment length (linearly interpolated)
 
-SUB_MAX = 0.4  # subharmonic level at full intensity
+# Subharmonics: sideband partials between the harmonics (soundgen addSubh). For a
+# period multiplier SUB_RATIO=G, sidebands sit at ratios n + s/G (s = 1..G-1), so
+# G=2 puts period-doubled energy at F0/2, 1.5*F0, 2.5*F0, ... across the spectrum.
+SUB_MAX = 0.4  # sideband level at full intensity, relative to the local envelope
+SUB_RATIO = 2  # period multiplier G (soundgen subRatio)
+SUB_WIDTH_HZ = 4000.0  # Gaussian sd of sideband strength vs Hz-distance to the
+# nearest harmonic (soundgen subWidth); large = flat, small
+# = growl concentrated where harmonics are dense/low
 DRIVE_MAX = 6.0  # tanh drive amount added at full intensity
 
 # Pitch chaos: occasional held jumps to a multiple of F0 — deterministic-chaos
