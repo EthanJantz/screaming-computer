@@ -24,8 +24,6 @@ import argparse
 import ast
 import select
 import sys
-import termios
-import tty
 from pathlib import Path
 
 # Implementation modules live as flat files under src/.
@@ -41,35 +39,9 @@ from intensity import (  # noqa: E402
     ManualIntensity,
 )
 from state import State  # noqa: E402
+from term import RawTerminal, read_key  # noqa: E402
 
 _TICK = 0.02  # seconds between target updates / display refreshes (~50 Hz)
-
-
-class _RawTerminal:
-    """Put the TTY in cbreak mode so we read single keypresses without Enter.
-
-    cbreak (not full raw) leaves signal keys working, so Ctrl-C still interrupts.
-    Restores the original terminal settings on exit no matter what.
-    """
-
-    def __enter__(self) -> "_RawTerminal":
-        self.fd = sys.stdin.fileno()
-        self.saved = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-
-
-def _read_key() -> str:
-    """Read one keypress, collapsing arrow-key escape sequences into e.g. '\\x1b[A'."""
-    ch = sys.stdin.read(1)
-    if ch == "\x1b":
-        ready, _, _ = select.select([sys.stdin], [], [], 0.001)
-        if ready:
-            ch += sys.stdin.read(2)
-    return ch
 
 
 def _bar(value: float, width: int = 20) -> str:
@@ -101,11 +73,11 @@ def _drive_loop(state: State, source: IntensitySource, engine: AudioEngine) -> N
     else:
         print(f"{type(source).__name__} driving the scream   q quit")
 
-    with _RawTerminal():
+    with RawTerminal():
         while True:
             ready, _, _ = select.select([sys.stdin], [], [], _TICK)
             if ready:
-                key = _read_key()
+                key = read_key()
                 if key in quit_keys:
                     break
                 if manual and key in up:
