@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Callable
+from typing import Callable, Sequence
 
 
 def _clamp01(x: float) -> float:
@@ -76,6 +76,53 @@ class FakeTurnIntensity(IntensitySource):
             return 0.0
         frac = (elapsed - self.idle) / self.search  # 0..1 rising ramp
         return self.peak * frac
+
+
+class ContourIntensity(IntensitySource):
+    """Plays a scripted intensity gesture on a timer, repeating after a pause.
+
+    ``times`` are 0..1 fractions of ``duration`` (seconds); ``intensity`` holds
+    the anchor values, linearly interpolated between anchors. After the gesture
+    the target drops to 0 for ``pause`` seconds — the audible release comes from
+    the audio callback's smoothing, as with ``FakeTurnIntensity`` — then the
+    gesture repeats. Configured by ``config.CONTOUR`` (which presets override).
+    """
+
+    def __init__(
+        self,
+        times: Sequence[float],
+        intensity: Sequence[float],
+        duration: float,
+        pause: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if len(times) != len(intensity) or len(times) < 2:
+            raise ValueError("need matching times/intensity with >= 2 anchors")
+        if duration <= 0.0 or pause < 0.0:
+            raise ValueError("require duration > 0 and pause >= 0")
+        if any(b < a for a, b in zip(times, times[1:])):
+            raise ValueError("times must be non-decreasing")
+        self._times = [float(t) for t in times]
+        self._values = [_clamp01(v) for v in intensity]
+        self.duration = duration
+        self.pause = pause
+        self._clock = clock
+        self._t0 = clock()
+
+    def target(self) -> float:
+        elapsed = (self._clock() - self._t0) % (self.duration + self.pause)
+        frac = elapsed / self.duration
+        if frac >= 1.0:
+            return 0.0  # in the pause between gestures
+        ts, vs = self._times, self._values
+        if frac <= ts[0]:
+            return vs[0]
+        for i in range(1, len(ts)):
+            if frac <= ts[i]:
+                span = ts[i] - ts[i - 1]
+                w = (frac - ts[i - 1]) / span if span > 0.0 else 1.0
+                return vs[i - 1] + (vs[i] - vs[i - 1]) * w
+        return vs[-1]
 
 
 class TelemetryIntensity(IntensitySource):

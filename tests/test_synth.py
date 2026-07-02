@@ -188,6 +188,21 @@ def test_regimes_off_is_passthrough(monkeypatch):
     assert voice._apply_regimes(params) is params
 
 
+def test_voice_reads_config_at_construction_not_import(monkeypatch):
+    """Presets mutate config after import; a new Voice must see the new values.
+
+    Regression: config defaults in the __init__ signature froze F0 at import
+    time, so `--preset` changed everything except the fundamental.
+    """
+    monkeypatch.setattr(config, "F0", 220.0)
+    monkeypatch.setattr(config, "SUB_RATIO", 3)
+    voice = Voice()
+    assert voice.f0 == 220.0
+    assert voice.harmonics.max() == int((config.SAMPLERATE / 2 - 1e-6) // 220.0)
+    # SUB_RATIO=3 -> two sidebands per harmonic gap (at n + 1/3 and n + 2/3).
+    assert 1.0 / 3.0 in voice._sub_ratios and 2.0 / 3.0 in voice._sub_ratios
+
+
 def test_intensity_extremes():
     idle, full = derive_params(0.0), derive_params(1.0)
     assert idle.amplitude == pytest.approx(config.AMP_FLOOR)

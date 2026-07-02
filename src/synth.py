@@ -156,15 +156,19 @@ class AdditiveVoice(Signal):
 class Voice:
     def __init__(
         self,
-        samplerate: int = config.SAMPLERATE,
-        f0: float = config.F0,
+        samplerate: int | None = None,
+        f0: float | None = None,
         formants: list[tuple[float, float]] | None = None,
     ) -> None:
-        self.samplerate = samplerate
-        self.f0 = f0
+        # Config fallbacks are resolved here, not in the signature: default
+        # argument values would freeze the config at import time, silently
+        # ignoring presets/--set overrides applied before the Voice is built.
+        self.samplerate = samplerate if samplerate is not None else config.SAMPLERATE
+        self.f0 = f0 if f0 is not None else config.F0
         self._formants: list[tuple[int, int]] = (
             formants if formants is not None else config.FORMANTS
         )
+        samplerate, f0 = self.samplerate, self.f0
         self._nyquist = samplerate / 2.0
 
         # Harmonics 1..H up to (but not including) Nyquist at the *idle* pitch. As
