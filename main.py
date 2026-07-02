@@ -9,6 +9,7 @@ Sources (`--source`):
     manual   keyboard control (up/k/+ louder, down/j/- softer). Milestone 2.
     contour  a scripted intensity gesture from config.CONTOUR, repeating.
     chess    play Stockfish; its search effort drives the scream. Milestone 6.
+    panel    hand-drive every SynthParams field live (bypasses intensity).
 
 Sound character comes from `--preset <name>` (see src/presets.py), with one-off
 tweaks via repeatable `--set KEY=VALUE`, e.g.:
@@ -137,6 +138,11 @@ def run(source_name: str = "fake", start: float = 0.0) -> None:
         if source_name == "chess":
             _run_chess(state)
             return
+        elif source_name == "panel":
+            import panel
+
+            panel.run(state, start)
+            return
         else:
             _drive_loop(state, source, engine)
             return
@@ -149,7 +155,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="screaming computer")
     parser.add_argument(
         "--source",
-        choices=("fake", "manual", "contour", "chess"),
+        choices=("fake", "manual", "contour", "chess", "panel"),
         default="fake",
         help="intensity source (default: fake — the milestone 3 swell/release timer)",
     )
@@ -157,7 +163,7 @@ def main() -> None:
         "--intensity",
         type=float,
         default=0.0,
-        help="starting value for the manual source",
+        help="starting value for the manual source / panel's initial derive_params",
     )
     parser.add_argument(
         "--preset",

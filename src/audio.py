@@ -24,9 +24,11 @@ class AudioEngine:
 
     def _callback(self, outdata, frames, time, status) -> None:
         # `status` flags underruns etc.; we can't safely print here, so ignore.
-        target = self.state.target_intensity
-        self.intensity += (target - self.intensity) * config.SMOOTH_COEFF
-        params = derive_params(self.intensity)
+        params = self.state.params  # single read: the panel may swap it any time
+        if params is None:
+            target = self.state.target_intensity
+            self.intensity += (target - self.intensity) * config.SMOOTH_COEFF
+            params = derive_params(self.intensity)
         outdata[:, 0] = self.voice.render_block(frames, params)
 
     def start(self) -> None:
