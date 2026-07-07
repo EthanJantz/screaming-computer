@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import config
-from synth import SynthParams, Voice, derive_params
+from synth import GateEnvelope, SynthParams, Voice, derive_params
 
 SEED = 42
 BLOCK = config.BLOCKSIZE
@@ -201,6 +201,60 @@ def test_voice_reads_config_at_construction_not_import(monkeypatch):
     assert voice.harmonics.max() == int((config.SAMPLERATE / 2 - 1e-6) // 220.0)
     # SUB_RATIO=3 -> two sidebands per harmonic gap (at n + 1/3 and n + 2/3).
     assert 1.0 / 3.0 in voice._sub_ratios and 2.0 / 3.0 in voice._sub_ratios
+
+
+# --- gate envelope (keyboard play mode) ---
+
+
+def _run_env(env: GateEnvelope, gate: float, blocks: int, ratio: float = 1.0):
+    """Feed constant targets; return (final glided ratio, concatenated ramps)."""
+    ramps = []
+    r = env.ratio
+    for _ in range(blocks):
+        r, ramp = env.step(BLOCK, gate, ratio)
+        ramps.append(ramp)
+    return r, np.concatenate(ramps)
+
+
+def test_gate_envelope_attack_and_release_track_config():
+    env = GateEnvelope(config.SAMPLERATE)
+    _run_env(env, 1.0, 3)  # 3 blocks ~ 35 ms >> GATE_ATTACK_MS
+    assert env.level > 0.9
+    _run_env(env, 1.0, 20)
+    assert env.level <= 1.0
+    # Release: ~3 time constants back toward silence.
+    blocks_3tau = int(3 * config.GATE_RELEASE_MS / 1000.0 * config.SAMPLERATE / BLOCK)
+    _run_env(env, 0.0, blocks_3tau)
+    assert env.level < 0.1
+
+
+def test_gate_envelope_ramps_are_click_free():
+    """Per-sample envelope steps stay small and block seams match the interior."""
+    env = GateEnvelope(config.SAMPLERATE)
+    _, y = _run_env(env, 1.0, 10)
+    steps = np.abs(np.diff(y))
+    assert steps.max() < 0.01  # a raw gate would step by ~1.0
+    seam_idx = np.arange(BLOCK - 1, steps.size, BLOCK)
+    assert steps[seam_idx].max() <= np.delete(steps, seam_idx).max() * 1.2
+
+
+def test_gate_glide_snaps_from_silence_but_glides_when_open():
+    env = GateEnvelope(config.SAMPLERATE)
+    ratio, _ = env.step(BLOCK, 1.0, 2.0)
+    assert ratio == 2.0  # first note after a rest attacks on pitch
+    _run_env(env, 1.0, 20, ratio=2.0)  # open the envelope fully
+    ratio, _ = env.step(BLOCK, 1.0, 1.0)
+    assert 1.0 < ratio < 2.0  # legato retarget glides instead of snapping
+    ratio, _ = _run_env(env, 1.0, 200, ratio=1.0)
+    assert ratio == pytest.approx(1.0, abs=1e-6)
+
+
+def test_gate_glide_disabled_snaps(monkeypatch):
+    monkeypatch.setattr(config, "GLIDE_MS", 0.0)
+    env = GateEnvelope(config.SAMPLERATE)
+    _run_env(env, 1.0, 20)
+    ratio, _ = env.step(BLOCK, 1.0, 3.0)
+    assert ratio == 3.0
 
 
 def test_intensity_extremes():

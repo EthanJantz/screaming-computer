@@ -14,6 +14,7 @@ layer on top of that voiced source.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -73,6 +74,53 @@ def derive_params(intensity: float) -> SynthParams:
         drive=1.0 + config.DRIVE_MAX * i if on("drive") else 1.0,
         drive_mix=i if on("drive") else 0.0,  # dry at idle, full wet at peak
     )
+
+
+class GateEnvelope:
+    """Note gate + portamento for keyboard play (the panel's play view).
+
+    A block-rate one-pole tracks the gate value with separate attack/release time
+    constants, returned as a per-block linear ramp so a fast attack inside a
+    single block can't step/click. The same object glides the note's pitch ratio;
+    while the envelope sits near silence the glide *snaps* instead, so the first
+    note after a rest attacks on pitch and only legato transitions slide.
+
+    Lives in the audio callback: `step` reads the gate/ratio targets the driver
+    published and must stay pure arithmetic.
+    """
+
+    _SILENCE = 1e-3  # below this level the voice is inaudible; pitch may snap
+
+    def __init__(self, samplerate: int) -> None:
+        self.samplerate = samplerate
+        self.level = 0.0  # envelope value at the *end* of the last block
+        self.ratio = 1.0  # current (glided) note ratio
+
+    def _coeff(self, frames: int, ms: float) -> float:
+        """One-pole coefficient covering `frames` samples for time constant `ms`."""
+        if ms <= 0.0:
+            return 1.0
+        return 1.0 - math.exp(-frames * 1000.0 / (self.samplerate * ms))
+
+    def step(
+        self, frames: int, gate: float, note_ratio: float
+    ) -> tuple[float, np.ndarray]:
+        """Advance one block toward `gate`; return (glided ratio, level ramp).
+
+        The ramp spans [previous level, new level) so consecutive blocks join
+        with interior-sized per-sample steps (same trick as the phase carry).
+        """
+        if self.level < self._SILENCE:
+            self.ratio = note_ratio
+        else:
+            self.ratio += (note_ratio - self.ratio) * self._coeff(
+                frames, config.GLIDE_MS
+            )
+        ms = config.GATE_ATTACK_MS if gate > self.level else config.GATE_RELEASE_MS
+        new = self.level + (gate - self.level) * self._coeff(frames, ms)
+        ramp = np.linspace(self.level, new, frames, endpoint=False)
+        self.level = new
+        return self.ratio, ramp
 
 
 def _formant_gain(freqs: np.ndarray, formants: list[tuple[int, int]]) -> np.ndarray:

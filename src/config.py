@@ -93,6 +93,18 @@ BREATH_CUTOFF = (
 # --- Intensity smoothing (per audio block) ---
 SMOOTH_COEFF = 0.02  # tune for an attack/release feel of ~0.2-0.6 s
 
+# --- Keyboard play mode (the panel's play view) ---
+# Terminals report key presses only (no key-up), so a note holds its gate open
+# NOTE_HOLD_MS past the most recent press; the OS key-repeat keeps extending that
+# deadline while the key is physically held (hold a key = sustain the note).
+GATE_ATTACK_MS = 8.0  # gate envelope attack time constant
+GATE_RELEASE_MS = 200.0  # gate envelope release time constant
+NOTE_HOLD_MS = 600.0  # gate-open time per press (must exceed the OS repeat delay)
+GLIDE_MS = 30.0  # legato portamento time constant (0 = pitch snaps instantly)
+PLAY_STRAIN_SEMITONES = 2.0  # cap on F0_RISE_SEMITONES while playing notes, so
+# intensity strains held notes sharp without wrecking
+# the pitch you played
+
 # --- Contour source (main.py --source contour) ---
 # A scripted intensity gesture: `times` are 0..1 fractions of `duration` (seconds),
 # `intensity` the anchor values (linearly interpolated between anchors). After the
