@@ -9,7 +9,9 @@ Sources (`--source`):
     manual   keyboard control (up/k/+ louder, down/j/- softer). Milestone 2.
     contour  a scripted intensity gesture from config.CONTOUR, repeating.
     chess    play Stockfish; its search effort drives the scream. Milestone 6.
-    panel    hand-drive every SynthParams field live (bypasses intensity).
+    panel    hand-drive every SynthParams field live (bypasses intensity); `]`
+             flips to a play view where home-row keys play the voice as a mono
+             keyboard instrument.
 
 Sound character comes from `--preset <name>` (see src/presets.py), with one-off
 tweaks via repeatable `--set KEY=VALUE`, e.g.:

@@ -7,13 +7,34 @@ import pytest
 
 import config
 from audio import AudioEngine
-from panel import SPECS, ParamPanel
+from panel import SPECS, ParamPanel, PlayView
 from state import State
 from synth import SynthParams, derive_params
 
 
 def make_panel(start: float = 0.5) -> ParamPanel:
     return ParamPanel(State(), start_intensity=start)
+
+
+@pytest.fixture(autouse=True)
+def _restore_strain_cap(monkeypatch):
+    """PlayView.enter() caps config.F0_RISE_SEMITONES; undo it after each test."""
+    monkeypatch.setattr(config, "F0_RISE_SEMITONES", config.F0_RISE_SEMITONES)
+
+
+class FakeClock:
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def make_play(start: float = 0.5) -> tuple[PlayView, FakeClock]:
+    clock = FakeClock()
+    play = PlayView(make_panel(start), clock=clock)
+    play.enter()
+    return play, clock
 
 
 def test_specs_cover_every_synth_param_in_order():
@@ -111,6 +132,90 @@ def test_lines_render_every_row_plus_header_and_intensity():
     assert len(lines) == len(SPECS) + 2  # header + intensity + params
     assert lines[1 + panel.row].startswith(">")
     assert "intensity" in lines[1]
+
+
+# --- play view ---
+
+
+def test_enter_arms_silence_and_caps_strain(monkeypatch):
+    monkeypatch.setattr(config, "F0_RISE_SEMITONES", 18.0)
+    play, _ = make_play()
+    assert play.state.gate == 0.0  # silent until a key is struck
+    assert config.F0_RISE_SEMITONES == config.PLAY_STRAIN_SEMITONES
+    play.leave()
+    assert config.F0_RISE_SEMITONES == 18.0
+    assert play.state.gate is None
+
+
+def test_note_press_publishes_ratio_and_opens_gate():
+    play, _ = make_play()
+    play.handle_key("a")  # C3 at the default octave
+    c3 = 440.0 * 2.0 ** ((48 - 69) / 12.0)
+    assert play.state.note_ratio == pytest.approx(c3 / config.F0)
+    assert play.state.gate == 1.0
+    play.handle_key("w")  # C#3: one semitone up
+    assert play.state.note_ratio == pytest.approx(c3 * 2 ** (1 / 12) / config.F0)
+
+
+def test_octave_shift_scales_the_ratio():
+    play, _ = make_play()
+    play.handle_key("a")
+    low = play.state.note_ratio
+    play.handle_key("x")
+    play.handle_key("a")
+    assert play.state.note_ratio == pytest.approx(2.0 * low)
+    play.handle_key("z")
+    play.handle_key("z")
+    play.handle_key("a")
+    assert play.state.note_ratio == pytest.approx(low / 2.0)
+
+
+def test_extend_on_repeat_sustains_past_the_hold(monkeypatch):
+    monkeypatch.setattr(config, "NOTE_HOLD_MS", 600.0)
+    play, clock = make_play()
+    play.handle_key("a")
+    clock.t = 0.5
+    assert not play.tick() and play.state.gate == 1.0  # before the deadline
+    play.handle_key("a")  # OS key-repeat extends the deadline
+    clock.t = 1.0
+    assert not play.tick() and play.state.gate == 1.0
+    clock.t = 1.2  # 0.5 + 0.6 < 1.2: deadline lapsed
+    assert play.tick() and play.state.gate == 0.0
+    assert not play.tick()  # already closed; nothing to redraw
+
+
+def test_legato_switches_pitch_without_closing_the_gate():
+    play, clock = make_play()
+    play.handle_key("a")
+    clock.t = 0.3
+    play.handle_key("h")  # A3 while C3 still sounds
+    assert play.state.gate == 1.0
+    a3 = 440.0 * 2.0 ** ((57 - 69) / 12.0)
+    assert play.state.note_ratio == pytest.approx(a3 / config.F0)
+
+
+def test_play_intensity_keys_drive_the_master_derive():
+    play, _ = make_play(start=0.5)
+    play.handle_key("=")
+    assert play.panel.intensity == pytest.approx(0.52)
+    assert play.state.params == derive_params(0.52)
+    play.handle_key("-")
+    assert play.panel.intensity == pytest.approx(0.5)
+
+
+def test_play_quit_keys_end_the_panel():
+    play, _ = make_play()
+    assert play.handle_key("q") is False
+    assert play.handle_key("\x03") is False
+
+
+def test_play_lines_render_keyboard_and_status():
+    play, _ = make_play()
+    play.handle_key("d")  # E3
+    lines = play.lines()
+    assert len(lines) == 5  # header + 2 key rows + note names + status
+    assert "\x1b[7md\x1b[27m" in lines[2]  # sounding key is highlighted
+    assert "note E3" in lines[-1]
 
 
 def test_audio_callback_uses_published_params_verbatim():
