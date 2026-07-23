@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import chess
@@ -26,6 +27,7 @@ import chess.engine
 
 from intensity import TelemetryIntensity
 from state import State
+from term import AltScreen, RawTerminal, read_key
 
 # --- Chess-specific tuning (stays with the driver, never in config.py) ---
 # Repo-local build, used as a last-resort fallback for development. Cloners are
@@ -70,6 +72,16 @@ N_MAX = 1_500_000  # deep search -> full-effort scream
 
 HUMAN_PLAYS_WHITE = True
 
+# --- board colors (256-color ANSI backgrounds/foregrounds) ---
+# Squares use tan/brown so both piece colors stay legible; the destination square
+# of the last move gets a green background so it pops without reading as an error.
+_LIGHT_BG = "\x1b[48;5;180m"
+_DARK_BG = "\x1b[48;5;94m"
+_LAST_MOVE_BG = "\x1b[48;5;107m"
+_WHITE_FG = "\x1b[38;5;231m"
+_BLACK_FG = "\x1b[38;5;16m"
+_RESET = "\x1b[0m"
+
 
 class ChessDriver:
     """Runs the game loop and feeds search effort into shared `State`."""
@@ -109,13 +121,69 @@ class ChessDriver:
             best = next(iter(self.board.legal_moves))
         return best
 
-    # --- terminal UI (line-based; swap for a GUI in the final product) ---
-    def _render_board(self) -> str:
-        # Board from the human's point of view (their pieces at the bottom).
-        orientation = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
-        return self.board.unicode(
-            borders=True, invert_color=True, orientation=orientation
+    # --- terminal UI (fixed-position frame on the alt screen, redrawn in place) ---
+    def _render_board(self) -> list[str]:
+        """Colored board lines from the human's point of view (their pieces at the
+        bottom). The destination square of the last move is highlighted."""
+        last_to = self.board.peek().to_square if self.board.move_stack else None
+        ranks = range(7, -1, -1) if HUMAN_PLAYS_WHITE else range(8)
+        files = range(8) if HUMAN_PLAYS_WHITE else range(7, -1, -1)
+        lines = []
+        for rank in ranks:
+            cells = []
+            for file in files:
+                square = chess.square(file, rank)
+                if square == last_to:
+                    bg = _LAST_MOVE_BG
+                else:
+                    bg = _LIGHT_BG if (file + rank) % 2 else _DARK_BG
+                piece = self.board.piece_at(square)
+                if piece:
+                    fg = _WHITE_FG if piece.color == chess.WHITE else _BLACK_FG
+                    # Always the filled glyph; side is carried by the fg color.
+                    glyph = chess.UNICODE_PIECE_SYMBOLS[piece.symbol().lower()]
+                    cells.append(f"{bg}{fg} {glyph} {_RESET}")
+                else:
+                    cells.append(f"{bg}   {_RESET}")
+            lines.append(f" {rank + 1} " + "".join(cells))
+        lines.append("   " + "".join(f" {chess.FILE_NAMES[f]} " for f in files))
+        return lines
+
+    def _draw(self, status: str, prompt: str = "") -> None:
+        """Repaint the whole frame at a fixed position (top of the alt screen).
+
+        Cursor-home + clear-each-line instead of a full screen wipe, so there is
+        no flicker; the cursor lands after `prompt`, where typed input echoes.
+        """
+        side = "White" if HUMAN_PLAYS_WHITE else "Black"
+        header = (
+            f"You are {side}. Stockfish thinks for {THINK_TIME:.0f}s per move — "
+            "listen for it to strain on the hard moves."
         )
+        out = ["\x1b[H"]
+        for line in (header, "", *self._render_board(), "", status):
+            out.append(f"\x1b[K{line}\n")
+        out.append(f"\x1b[K{prompt}\x1b[J")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    def _read_line(self, status: str, prompt: str) -> str | None:
+        """Minimal line editor: cbreak mode reads keys, so we echo by redrawing.
+
+        Returns the entered line, or None on EOF (stdin closed).
+        """
+        buf = ""
+        while True:
+            self._draw(status, prompt + buf)
+            key = read_key()
+            if not key:  # EOF
+                return None
+            if key in ("\r", "\n"):
+                return buf.strip()
+            if key in ("\x7f", "\x08"):  # backspace
+                buf = buf[:-1]
+            elif len(key) == 1 and key.isprintable():
+                buf += key
 
     def _parse_move(self, raw: str) -> chess.Move | None:
         for parse in (self.board.parse_san, self.board.parse_uci):
@@ -127,42 +195,47 @@ class ChessDriver:
                 return move
         return None
 
-    def _human_move(self) -> bool:
+    def _human_move(self, status: str) -> bool:
         """Prompt for the human's move. Returns False if they want to quit."""
+        prompt = "your move (e.g. e4, Nf3, or g1f3) — 'moves' to list, 'q' to quit: "
         while True:
-            try:
-                raw = input(
-                    "your move (e.g. e4, Nf3, or g1f3) — 'moves' to list, 'q' to quit: "
-                ).strip()
-            except EOFError:
-                return False
-            if raw in ("q", "quit"):
+            raw = self._read_line(status, prompt)
+            if raw is None or raw in ("q", "quit"):
                 return False
             if raw in ("moves", "l"):
-                print("  " + ", ".join(self.board.san(m) for m in self.board.legal_moves))
+                status = ", ".join(self.board.san(m) for m in self.board.legal_moves)
                 continue
             move = self._parse_move(raw)
             if move is None:
-                print("  not a legal move here — type 'moves' to see the options")
+                status = f"{raw!r} is not a legal move here — 'moves' lists the options"
                 continue
             self.board.push(move)
             return True
 
     def play(self) -> None:
         human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
-        side = "White" if HUMAN_PLAYS_WHITE else "Black"
-        print(f"You are {side}. Stockfish thinks for {THINK_TIME:.0f}s per move.")
-        print("Listen for it to strain on the hard moves.\n")
-        while not self.board.is_game_over():
-            print(self._render_board())
-            if self.board.turn == human:
-                if not self._human_move():
-                    print("Resigning. Good game.")
-                    return
-            else:
-                print("Stockfish is thinking...")
-                move = self._engine_move()
-                print(f"Stockfish plays {self.board.san(move)}\n")
-                self.board.push(move)
-        print(self._render_board())
-        print(f"Game over — {self.board.result()} ({self.board.outcome().termination.name.lower()})")
+        status = "Your move." if self.board.turn == human else ""
+        result = "Resigned. Good game."
+        try:
+            with AltScreen(), RawTerminal():
+                while not self.board.is_game_over():
+                    if self.board.turn == human:
+                        if not self._human_move(status):
+                            break
+                        status = ""
+                    else:
+                        self._draw("Stockfish is thinking...")
+                        move = self._engine_move()
+                        status = f"Stockfish plays {self.board.san(move)} — your move."
+                        self.board.push(move)
+                if self.board.is_game_over():
+                    result = (
+                        f"Game over — {self.board.result()} "
+                        f"({self.board.outcome().termination.name.lower()})"
+                    )
+                    self._draw(f"{result}   press any key to exit")
+                    read_key()
+        except KeyboardInterrupt:
+            pass  # treated as resign; the context managers unwind the screen
+        # The alt screen vanishes on exit, so leave the outcome on the normal one.
+        print(result)

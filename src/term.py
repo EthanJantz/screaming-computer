@@ -8,6 +8,23 @@ import termios
 import tty
 
 
+class AltScreen:
+    """Switch to the terminal's alternate screen buffer for full-screen TUIs.
+
+    Drivers that own the whole screen (e.g. the chess board) draw here; the main
+    screen and its scrollback come back untouched on exit.
+    """
+
+    def __enter__(self) -> "AltScreen":
+        sys.stdout.write("\x1b[?1049h\x1b[H")
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        sys.stdout.write("\x1b[?1049l")
+        sys.stdout.flush()
+
+
 class RawTerminal:
     """Put the TTY in cbreak mode so we read single keypresses without Enter.
 
