@@ -4,13 +4,15 @@ This is the project's first real "driver". It is one facade over the screaming
 computer — the synth and audio engine know nothing about it. The contract with the
 core is, as always, a single 0..1 intensity in shared state.
 
-What screams here is the engine *doing work*: while Stockfish searches, we stream its
-live node count and map it (log scale) into intensity via a `TelemetryIntensity`. The
-voice swells as the search deepens and snaps back to idle once the move resolves. The
-scream is NOT about who is winning — a losing position the engine breezes through is
-quiet; a hard position it grinds on is loud. Work, not opinion.
+What screams here is the engine *doing work*: Stockfish searches every move to a
+fixed depth, and we map the *time it takes to reach that depth* (log scale) into
+intensity via a `TelemetryIntensity`. An easy position hits the depth almost
+instantly and stays quiet; a hard one grinds for seconds and swells loud, snapping
+back to idle once the move resolves. The scream is NOT about who is winning — a
+losing position the engine breezes through is quiet; a hard position it grinds on is
+loud. Work, not opinion.
 
-Everything chess-specific (Stockfish path, think time, node->intensity calibration,
+Everything chess-specific (Stockfish path, search depth, time->intensity calibration,
 the TUI) lives in this file. To add another work source, write a sibling driver that
 feeds its own metric into a `TelemetryIntensity`; nothing else changes.
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import chess
@@ -69,13 +72,20 @@ def _find_stockfish() -> str:
     raise FileNotFoundError(_INSTALL_HINT)
 
 
-THINK_TIME = 2.0  # seconds Stockfish searches per move (its "turn" length)
+# Approach A: fix the *search depth* so every move is the same "amount of thinking",
+# and let the TIME to reach that depth be the difficulty signal — an easy position
+# hits SEARCH_DEPTH in a blink (quiet), a hard one grinds for seconds (loud). This is
+# what makes "the computer is working harder" audible, where a fixed think-time (every
+# move burning ~the same node count) did not.
+SEARCH_DEPTH = 20  # plies searched per move (its "turn"); tune for your CPU's speed
+TIME_CAP = 8.0  # seconds: safety cap so a pathological position can't grind forever
 
-# Node counts mapping to idle/full effort. Calibrated by ear on this machine: a 2 s
-# search reaches ~1M nodes here, so the swell tops out near full effort at the end of
-# the think. Tune these if the scream peaks too early/late or never reaches the top.
-N_MIN = 2_000  # search just started -> idle
-N_MAX = 1_500_000  # deep search -> full-effort scream
+# Elapsed search time (seconds) mapping to idle/full effort, log-scaled because think
+# times span orders of magnitude across positions. Calibrate by ear to the spread
+# SEARCH_DEPTH actually produces here: lower T_MAX if hard moves never reach the top,
+# raise it if easy moves already peak.
+T_MIN = 0.1  # reached the depth almost instantly -> idle
+T_MAX = 4.0  # a long grind to the depth -> full-effort scream
 
 HUMAN_PLAYS_WHITE = True
 
@@ -119,7 +129,7 @@ class ChessDriver:
         # real on every _draw from the terminal size; this default matches a minimal
         # board (and is what the unit tests exercise directly).
         self.cell_w, self.cell_h = 3, 1
-        self.intensity = TelemetryIntensity(N_MIN, N_MAX)
+        self.intensity = TelemetryIntensity(T_MIN, T_MAX)
         self.engine = chess.engine.SimpleEngine.popen_uci(stockfish)
 
     def close(self) -> None:
@@ -129,17 +139,18 @@ class ChessDriver:
         except Exception:
             pass  # already dead / never started — nothing to clean up
 
-    # --- the work: stream Stockfish's search, scream by its node count ---
+    # --- the work: fixed-depth search; scream by how long it takes to get there ---
     def _engine_move(self) -> chess.Move:
         best: chess.Move | None = None
-        limit = chess.engine.Limit(time=THINK_TIME)
+        limit = chess.engine.Limit(depth=SEARCH_DEPTH, time=TIME_CAP)
+        start = time.monotonic()
         with self.engine.analysis(self.board, limit) as analysis:
             for info in analysis:
-                nodes = info.get("nodes")
-                if nodes:
-                    self.intensity.update(nodes)
-                    # Single atomic float write — the only cross-thread contact point.
-                    self.state.target_intensity = self.intensity.target()
+                # Elapsed time to the current depth is the effort signal: harder
+                # positions take longer to reach SEARCH_DEPTH, so they swell louder.
+                self.intensity.update(time.monotonic() - start)
+                # Single atomic float write — the only cross-thread contact point.
+                self.state.target_intensity = self.intensity.target()
                 pv = info.get("pv")
                 if pv:
                     best = pv[0]  # deepest principal variation = engine's choice
@@ -285,8 +296,8 @@ class ChessDriver:
         self.cell_w, self.cell_h = self._cell_size(cols, rows)
         side = "White" if HUMAN_PLAYS_WHITE else "Black"
         header = (
-            f"You are {side}. Stockfish thinks for {THINK_TIME:.0f}s per move — "
-            "listen for it to strain on the hard moves."
+            f"You are {side}. Stockfish searches to depth {SEARCH_DEPTH} — the harder "
+            "the position, the longer (and louder) it strains."
         )
         # Keep header/status to one line: a wrapped header would push the board down
         # and desync mouse hit-testing (see _square_at).
