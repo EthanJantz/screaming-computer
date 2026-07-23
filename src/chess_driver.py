@@ -27,7 +27,14 @@ import chess.engine
 
 from intensity import TelemetryIntensity
 from state import State
-from term import AltScreen, RawTerminal, read_key
+from term import (
+    AltScreen,
+    MouseTracking,
+    RawTerminal,
+    flush_input,
+    parse_mouse,
+    read_key,
+)
 
 # --- Chess-specific tuning (stays with the driver, never in config.py) ---
 # Repo-local build, used as a last-resort fallback for development. Cloners are
@@ -77,7 +84,9 @@ HUMAN_PLAYS_WHITE = True
 # of the last move gets a green background so it pops without reading as an error.
 _LIGHT_BG = "\x1b[48;5;180m"
 _DARK_BG = "\x1b[48;5;94m"
-_LAST_MOVE_BG = "\x1b[48;5;107m"
+_LAST_MOVE_BG = "\x1b[48;5;107m"  # green: destination of the last move
+_SELECTED_BG = "\x1b[48;5;179m"  # amber: the piece the mouse has picked up
+_TARGET_BG = "\x1b[48;5;108m"  # muted green: a legal destination for it
 _WHITE_FG = "\x1b[38;5;231m"
 _BLACK_FG = "\x1b[38;5;16m"
 _RESET = "\x1b[0m"
@@ -90,6 +99,8 @@ class ChessDriver:
         stockfish = _find_stockfish()  # raises FileNotFoundError with an install hint
         self.state = state
         self.board = chess.Board()
+        self.human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
+        self.selected: chess.Square | None = None  # square the mouse has picked up
         self.intensity = TelemetryIntensity(N_MIN, N_MAX)
         self.engine = chess.engine.SimpleEngine.popen_uci(stockfish)
 
@@ -124,8 +135,16 @@ class ChessDriver:
     # --- terminal UI (fixed-position frame on the alt screen, redrawn in place) ---
     def _render_board(self) -> list[str]:
         """Colored board lines from the human's point of view (their pieces at the
-        bottom). The destination square of the last move is highlighted."""
+        bottom). Highlights the last move's destination and, while a piece is picked
+        up by the mouse, that square and its legal destinations."""
         last_to = self.board.peek().to_square if self.board.move_stack else None
+        targets = set()
+        if self.selected is not None:
+            targets = {
+                m.to_square
+                for m in self.board.legal_moves
+                if m.from_square == self.selected
+            }
         ranks = range(7, -1, -1) if HUMAN_PLAYS_WHITE else range(8)
         files = range(8) if HUMAN_PLAYS_WHITE else range(7, -1, -1)
         lines = []
@@ -133,7 +152,11 @@ class ChessDriver:
             cells = []
             for file in files:
                 square = chess.square(file, rank)
-                if square == last_to:
+                if square == self.selected:
+                    bg = _SELECTED_BG
+                elif square in targets:
+                    bg = _TARGET_BG
+                elif square == last_to:
                     bg = _LAST_MOVE_BG
                 else:
                     bg = _LIGHT_BG if (file + rank) % 2 else _DARK_BG
@@ -143,11 +166,75 @@ class ChessDriver:
                     # Always the filled glyph; side is carried by the fg color.
                     glyph = chess.UNICODE_PIECE_SYMBOLS[piece.symbol().lower()]
                     cells.append(f"{bg}{fg} {glyph} {_RESET}")
+                elif square in targets:
+                    cells.append(f"{bg}{_BLACK_FG} · {_RESET}")  # empty legal square
                 else:
                     cells.append(f"{bg}   {_RESET}")
             lines.append(f" {rank + 1} " + "".join(cells))
         lines.append("   " + "".join(f" {chess.FILE_NAMES[f]} " for f in files))
         return lines
+
+    def _square_at(self, col: int, row: int) -> chess.Square | None:
+        """Map a 1-based terminal (col, row) to a board square, or None if off-board.
+
+        Mirrors the fixed layout in `_draw`: header on row 1, blank row 2, the eight
+        board lines on rows 3..10; each line is a 3-column rank label then 3 columns
+        per square. Reverses the same orientation logic `_render_board` draws with.
+        """
+        line = row - 3
+        if not 0 <= line <= 7 or col < 4:
+            return None
+        file_idx = (col - 4) // 3
+        if not 0 <= file_idx <= 7:
+            return None
+        if HUMAN_PLAYS_WHITE:
+            return chess.square(file_idx, 7 - line)
+        return chess.square(7 - file_idx, line)
+
+    def _move_between(
+        self, frm: chess.Square, to: chess.Square
+    ) -> chess.Move | None:
+        """The legal move from `frm` to `to`, or None. Auto-queens a promotion;
+        type the move (e.g. e8=N) to underpromote."""
+        candidates = [
+            m
+            for m in self.board.legal_moves
+            if m.from_square == frm and m.to_square == to
+        ]
+        for move in candidates:
+            if move.promotion in (None, chess.QUEEN):
+                return move
+        return candidates[0] if candidates else None
+
+    def _click(self, col: int, row: int) -> tuple[chess.Move | None, str]:
+        """Resolve a left-click into a move via two clicks (from, then to).
+
+        Returns (move-or-None, new status line). First click picks up one of the
+        human's pieces; the second either completes a legal move, re-picks another
+        own piece, or clears the selection.
+        """
+        square = self._square_at(col, row)
+        if square is None:  # clicked the border/labels — drop any selection
+            self.selected = None
+            return None, ""
+        piece = self.board.piece_at(square)
+        if self.selected is None:
+            if piece is not None and piece.color == self.human:
+                self.selected = square
+                return None, f"{chess.square_name(square)} — click a destination"
+            return None, ""
+        if square == self.selected:  # click the picked-up piece again to drop it
+            self.selected = None
+            return None, ""
+        move = self._move_between(self.selected, square)
+        if move is not None:
+            self.selected = None
+            return move, ""
+        if piece is not None and piece.color == self.human:  # switch pieces
+            self.selected = square
+            return None, f"{chess.square_name(square)} — click a destination"
+        self.selected = None
+        return None, "not a legal destination — 'moves' lists the options"
 
     def _draw(self, status: str, prompt: str = "") -> None:
         """Repaint the whole frame at a fixed position (top of the alt screen).
@@ -167,24 +254,6 @@ class ChessDriver:
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
-    def _read_line(self, status: str, prompt: str) -> str | None:
-        """Minimal line editor: cbreak mode reads keys, so we echo by redrawing.
-
-        Returns the entered line, or None on EOF (stdin closed).
-        """
-        buf = ""
-        while True:
-            self._draw(status, prompt + buf)
-            key = read_key()
-            if not key:  # EOF
-                return None
-            if key in ("\r", "\n"):
-                return buf.strip()
-            if key in ("\x7f", "\x08"):  # backspace
-                buf = buf[:-1]
-            elif len(key) == 1 and key.isprintable():
-                buf += key
-
     def _parse_move(self, raw: str) -> chess.Move | None:
         for parse in (self.board.parse_san, self.board.parse_uci):
             try:
@@ -195,31 +264,63 @@ class ChessDriver:
                 return move
         return None
 
+    def _typed_move(self, raw: str) -> tuple[chess.Move | None, str | None]:
+        """Interpret a typed line: (move, None) to play, (None, status) to report,
+        or (None, None) to quit. 'moves'/'l' lists; a bad move explains itself."""
+        if raw in ("q", "quit"):
+            return None, None
+        if raw in ("moves", "l"):
+            return None, ", ".join(self.board.san(m) for m in self.board.legal_moves)
+        move = self._parse_move(raw)
+        if move is None:
+            return None, f"{raw!r} is not a legal move here — 'moves' lists the options"
+        return move, ""
+
     def _human_move(self, status: str) -> bool:
-        """Prompt for the human's move. Returns False if they want to quit."""
-        prompt = "your move (e.g. e4, Nf3, or g1f3) — 'moves' to list, 'q' to quit: "
+        """The human's turn: play by clicking (two clicks: piece, then destination)
+        or by typing a move. Cbreak mode reads keys one at a time, so we echo the
+        typed buffer by redrawing. Returns False if they resign/quit."""
+        prompt = "click a piece or type a move (e.g. e4, g1f3) — 'moves', 'q' quit: "
+        flush_input()  # drop any clicks that landed while Stockfish was thinking
+        self.selected = None
+        buf = ""
         while True:
-            raw = self._read_line(status, prompt)
-            if raw is None or raw in ("q", "quit"):
+            self._draw(status, prompt + buf)
+            key = read_key()
+            if not key:  # EOF (stdin closed)
                 return False
-            if raw in ("moves", "l"):
-                status = ", ".join(self.board.san(m) for m in self.board.legal_moves)
+            mouse = parse_mouse(key)
+            if mouse is not None:
+                col, row, button, pressed = mouse
+                # Left-button press only; ignore releases, other buttons, the wheel.
+                if pressed and (button & 0b11) == 0 and not (button & 64):
+                    move, status = self._click(col, row)
+                    if move is not None:
+                        self.board.push(move)
+                        return True
                 continue
-            move = self._parse_move(raw)
-            if move is None:
-                status = f"{raw!r} is not a legal move here — 'moves' lists the options"
-                continue
-            self.board.push(move)
-            return True
+            if key in ("\r", "\n"):
+                raw, buf = buf.strip(), ""
+                if not raw:
+                    continue
+                move, status = self._typed_move(raw)
+                if move is not None:
+                    self.board.push(move)
+                    return True
+                if status is None:  # q/quit
+                    return False
+            elif key in ("\x7f", "\x08"):  # backspace
+                buf = buf[:-1]
+            elif len(key) == 1 and key.isprintable():
+                buf += key
 
     def play(self) -> None:
-        human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
-        status = "Your move." if self.board.turn == human else ""
+        status = "Your move." if self.board.turn == self.human else ""
         result = "Resigned. Good game."
         try:
-            with AltScreen(), RawTerminal():
+            with AltScreen(), MouseTracking(), RawTerminal():
                 while not self.board.is_game_over():
-                    if self.board.turn == human:
+                    if self.board.turn == self.human:
                         if not self._human_move(status):
                             break
                         status = ""
