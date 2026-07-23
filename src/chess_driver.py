@@ -91,6 +91,20 @@ _WHITE_FG = "\x1b[38;5;231m"
 _BLACK_FG = "\x1b[38;5;16m"
 _RESET = "\x1b[0m"
 
+# The board scales up on roomier terminals (no font change needed). Squares are
+# drawn CELL_W columns by CELL_H rows; ~2:1 keeps them visually square on a
+# terminal's tall cells. _LABEL_W is the left gutter that holds the rank digits.
+_LABEL_W = 3
+# A piece is a single terminal glyph that can't grow with the cell, so the cap is
+# deliberately small: past ~4x2 the glyph starts to look lost in the square.
+_MAX_CELL_H = 2
+
+
+def _center(text: str, width: int) -> str:
+    """`text` centered in `width` columns (slightly left-biased for odd padding)."""
+    left = (width - len(text)) // 2
+    return " " * left + text + " " * (width - len(text) - left)
+
 
 class ChessDriver:
     """Runs the game loop and feeds search effort into shared `State`."""
@@ -101,6 +115,10 @@ class ChessDriver:
         self.board = chess.Board()
         self.human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
         self.selected: chess.Square | None = None  # square the mouse has picked up
+        # Cell size of the last drawn frame; _square_at hit-tests against it. Set for
+        # real on every _draw from the terminal size; this default matches a minimal
+        # board (and is what the unit tests exercise directly).
+        self.cell_w, self.cell_h = 3, 1
         self.intensity = TelemetryIntensity(N_MIN, N_MAX)
         self.engine = chess.engine.SimpleEngine.popen_uci(stockfish)
 
@@ -135,8 +153,12 @@ class ChessDriver:
     # --- terminal UI (fixed-position frame on the alt screen, redrawn in place) ---
     def _render_board(self) -> list[str]:
         """Colored board lines from the human's point of view (their pieces at the
-        bottom). Highlights the last move's destination and, while a piece is picked
-        up by the mouse, that square and its legal destinations."""
+        bottom), scaled to `self.cell_w` x `self.cell_h` per square. Highlights the
+        last move's destination and, while a piece is picked up by the mouse, that
+        square and its legal destinations. Each rank spans cell_h lines; the piece
+        glyph / dot / rank digit sit on the block's middle line."""
+        w, h = self.cell_w, self.cell_h
+        mid = h // 2
         last_to = self.board.peek().to_square if self.board.move_stack else None
         targets = set()
         if self.selected is not None:
@@ -149,42 +171,46 @@ class ChessDriver:
         files = range(8) if HUMAN_PLAYS_WHITE else range(7, -1, -1)
         lines = []
         for rank in ranks:
-            cells = []
-            for file in files:
-                square = chess.square(file, rank)
-                if square == self.selected:
-                    bg = _SELECTED_BG
-                elif square in targets:
-                    bg = _TARGET_BG
-                elif square == last_to:
-                    bg = _LAST_MOVE_BG
-                else:
-                    bg = _LIGHT_BG if (file + rank) % 2 else _DARK_BG
-                piece = self.board.piece_at(square)
-                if piece:
-                    fg = _WHITE_FG if piece.color == chess.WHITE else _BLACK_FG
-                    # Always the filled glyph; side is carried by the fg color.
-                    glyph = chess.UNICODE_PIECE_SYMBOLS[piece.symbol().lower()]
-                    cells.append(f"{bg}{fg} {glyph} {_RESET}")
-                elif square in targets:
-                    cells.append(f"{bg}{_BLACK_FG} · {_RESET}")  # empty legal square
-                else:
-                    cells.append(f"{bg}   {_RESET}")
-            lines.append(f" {rank + 1} " + "".join(cells))
-        lines.append("   " + "".join(f" {chess.FILE_NAMES[f]} " for f in files))
+            for sub in range(h):
+                label = _center(str(rank + 1), _LABEL_W) if sub == mid else " " * _LABEL_W
+                cells = [label]
+                for file in files:
+                    square = chess.square(file, rank)
+                    if square == self.selected:
+                        bg = _SELECTED_BG
+                    elif square in targets:
+                        bg = _TARGET_BG
+                    elif square == last_to:
+                        bg = _LAST_MOVE_BG
+                    else:
+                        bg = _LIGHT_BG if (file + rank) % 2 else _DARK_BG
+                    piece = self.board.piece_at(square)
+                    if sub == mid and piece:
+                        fg = _WHITE_FG if piece.color == chess.WHITE else _BLACK_FG
+                        # Always the filled glyph; side is carried by the fg color.
+                        glyph = chess.UNICODE_PIECE_SYMBOLS[piece.symbol().lower()]
+                        cells.append(f"{bg}{fg}{_center(glyph, w)}{_RESET}")
+                    elif sub == mid and square in targets:
+                        cells.append(f"{bg}{_BLACK_FG}{_center('·', w)}{_RESET}")
+                    else:
+                        cells.append(f"{bg}{' ' * w}{_RESET}")
+                lines.append("".join(cells))
+        labels = "".join(_center(chess.FILE_NAMES[f], w) for f in files)
+        lines.append(" " * _LABEL_W + labels)
         return lines
 
     def _square_at(self, col: int, row: int) -> chess.Square | None:
         """Map a 1-based terminal (col, row) to a board square, or None if off-board.
 
-        Mirrors the fixed layout in `_draw`: header on row 1, blank row 2, the eight
-        board lines on rows 3..10; each line is a 3-column rank label then 3 columns
-        per square. Reverses the same orientation logic `_render_board` draws with.
+        Inverts the fixed layout in `_draw`: header on row 1, blank row 2, then the
+        board from row 3, each rank cell_h rows tall; a cell_w-wide square after the
+        _LABEL_W-column rank gutter. Uses the same cell size the last frame drew with,
+        and reverses the orientation logic `_render_board` draws with.
         """
-        line = row - 3
-        if not 0 <= line <= 7 or col < 4:
+        line = (row - 3) // self.cell_h
+        if not 0 <= line <= 7 or col <= _LABEL_W:
             return None
-        file_idx = (col - 4) // 3
+        file_idx = (col - _LABEL_W - 1) // self.cell_w
         if not 0 <= file_idx <= 7:
             return None
         if HUMAN_PLAYS_WHITE:
@@ -236,19 +262,36 @@ class ChessDriver:
         self.selected = None
         return None, "not a legal destination — 'moves' lists the options"
 
+    def _cell_size(self, cols: int, rows: int) -> tuple[int, int]:
+        """Largest CELL_W x CELL_H (in terminal cells) that fits the board, its
+        gutter, and the surrounding chrome in a `cols` x `rows` terminal, keeping a
+        ~2:1 aspect so squares look square. Never smaller than the minimal 3x1."""
+        # Chrome around the 8*h board lines: header, blank, file labels, blank,
+        # status, prompt = 6 rows; the gutter + 8 squares must fit `cols`.
+        h = (rows - 6) // 8
+        w_fit = (cols - _LABEL_W) // 8
+        h = max(1, min(h, w_fit // 2, _MAX_CELL_H))
+        w = max(3, min(2 * h, w_fit))
+        return w, h
+
     def _draw(self, status: str, prompt: str = "") -> None:
         """Repaint the whole frame at a fixed position (top of the alt screen).
 
         Cursor-home + clear-each-line instead of a full screen wipe, so there is
-        no flicker; the cursor lands after `prompt`, where typed input echoes.
+        no flicker; the cursor lands after `prompt`, where typed input echoes. The
+        board is sized to the terminal each frame, so nothing scrolls off.
         """
+        cols, rows = shutil.get_terminal_size(fallback=(80, 24))
+        self.cell_w, self.cell_h = self._cell_size(cols, rows)
         side = "White" if HUMAN_PLAYS_WHITE else "Black"
         header = (
             f"You are {side}. Stockfish thinks for {THINK_TIME:.0f}s per move — "
             "listen for it to strain on the hard moves."
         )
+        # Keep header/status to one line: a wrapped header would push the board down
+        # and desync mouse hit-testing (see _square_at).
         out = ["\x1b[H"]
-        for line in (header, "", *self._render_board(), "", status):
+        for line in (header[:cols], "", *self._render_board(), "", status[:cols]):
             out.append(f"\x1b[K{line}\n")
         out.append(f"\x1b[K{prompt}\x1b[J")
         sys.stdout.write("".join(out))

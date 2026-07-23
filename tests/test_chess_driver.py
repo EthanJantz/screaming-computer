@@ -24,6 +24,7 @@ def make_driver(fen: str | None = None) -> ChessDriver:
     d.board = chess.Board(fen) if fen else chess.Board()
     d.human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
     d.selected = None
+    d.cell_w, d.cell_h = 3, 1  # minimal board; _draw would size this to the terminal
     return d
 
 
@@ -51,6 +52,39 @@ def test_square_at_rejects_off_board_clicks():
     assert d._square_at(16, 2) is None  # header row (above the board)
     assert d._square_at(16, 11) is None  # below the board
     assert d._square_at(28, 3) is None  # right of the h-file (file_idx > 7)
+
+
+def test_square_at_uses_the_current_cell_size():
+    """At a larger cell size, hit-testing scales: a1 fills a 6x3 block from the
+    bottom-left, and clicks anywhere inside it map to the same square."""
+    d = make_driver()
+    d.cell_w, d.cell_h = 6, 3
+    # a1 occupies cols 4..9 and the three board lines for rank 1 (rows 24..26).
+    for row in (24, 25, 26):
+        for col in (4, 6, 9):
+            assert d._square_at(col, row) == chess.A1
+    assert d._square_at(10, 26) == chess.B1  # next file over
+    assert d._square_at(4, 27) is None  # one row below the board
+
+
+# --- _cell_size: scale the board to fill the terminal, keeping a ~2:1 aspect ---
+
+
+def test_cell_size_grows_on_a_roomy_terminal():
+    d = make_driver()
+    assert d._cell_size(80, 24) == (4, 2)  # bigger than the minimal 3x1 board
+
+
+def test_cell_size_caps_so_the_glyph_stays_proportionate():
+    d = make_driver()
+    # A lone glyph can't grow, so cells stop enlarging past the cap even on a
+    # huge terminal (bounded by _MAX_CELL_H).
+    assert d._cell_size(400, 200) == (4, 2)
+
+
+def test_cell_size_never_below_the_minimal_board():
+    d = make_driver()
+    assert d._cell_size(20, 10) == (3, 1)  # clamps up so the board still renders
 
 
 # --- _move_between: the legal move joining two squares, auto-queening promotions ---
@@ -152,6 +186,16 @@ def test_render_marks_the_selection_and_its_legal_targets():
     assert joined.count(_SELECTED_BG) == 1
     assert joined.count(_TARGET_BG) == 2
     assert "·" in joined  # empty legal squares get a dot marker
+
+
+def test_render_scales_to_the_cell_size():
+    d = make_driver()
+    d.cell_w, d.cell_h = 6, 3
+    lines = d._render_board()
+    assert len(lines) == 8 * 3 + 1  # each rank is cell_h lines, plus the label row
+    d.board.push_san("e4")
+    joined = "\n".join(d._render_board())
+    assert joined.count(_LAST_MOVE_BG) == 3  # the e4 square spans all cell_h lines
 
 
 # --- _typed_move: interpreting a typed line into a move/status/quit ---
