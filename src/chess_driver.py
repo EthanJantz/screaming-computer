@@ -183,7 +183,9 @@ class ChessDriver:
         lines = []
         for rank in ranks:
             for sub in range(h):
-                label = _center(str(rank + 1), _LABEL_W) if sub == mid else " " * _LABEL_W
+                label = (
+                    _center(str(rank + 1), _LABEL_W) if sub == mid else " " * _LABEL_W
+                )
                 cells = [label]
                 for file in files:
                     square = chess.square(file, rank)
@@ -228,9 +230,7 @@ class ChessDriver:
             return chess.square(file_idx, 7 - line)
         return chess.square(7 - file_idx, line)
 
-    def _move_between(
-        self, frm: chess.Square, to: chess.Square
-    ) -> chess.Move | None:
+    def _move_between(self, frm: chess.Square, to: chess.Square) -> chess.Move | None:
         """The legal move from `frm` to `to`, or None. Auto-queens a promotion;
         type the move (e.g. e8=N) to underpromote."""
         candidates = [
@@ -371,26 +371,21 @@ class ChessDriver:
     def play(self) -> None:
         status = "Your move." if self.board.turn == self.human else ""
         result = "Resigned. Good game."
-        try:
-            with AltScreen(), MouseTracking(), RawTerminal():
-                while not self.board.is_game_over():
-                    if self.board.turn == self.human:
-                        if not self._human_move(status):
-                            break
-                        status = ""
-                    else:
-                        self._draw("Stockfish is thinking...")
-                        move = self._engine_move()
-                        status = f"Stockfish plays {self.board.san(move)} — your move."
-                        self.board.push(move)
-                if self.board.is_game_over():
-                    result = (
-                        f"Game over — {self.board.result()} "
-                        f"({self.board.outcome().termination.name.lower()})"
-                    )
-                    self._draw(f"{result}   press any key to exit")
-                    read_key()
-        except KeyboardInterrupt:
-            pass  # treated as resign; the context managers unwind the screen
-        # The alt screen vanishes on exit, so leave the outcome on the normal one.
-        print(result)
+        with AltScreen(), MouseTracking(), RawTerminal():
+            while not self.board.is_game_over():
+                if self.board.turn == self.human:
+                    if not self._human_move(status):
+                        break
+                    status = ""
+                else:
+                    self._draw("Stockfish is thinking...")
+                    move = self._engine_move()
+                    status = f"Stockfish plays {self.board.san(move)} — your move."
+                    self.board.push(move)
+            if self.board.is_game_over():
+                result = (
+                    f"Game over — {self.board.result()} "
+                    f"({self.board.outcome().termination.name.lower()})"
+                )
+                self._draw(f"{result}   press any key to exit")
+                read_key()

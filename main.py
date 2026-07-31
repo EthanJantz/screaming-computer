@@ -138,8 +138,9 @@ def run(source_name: str = "fake", start: float = 0.0) -> None:
     state.target_intensity = source.target()
     try:
         if source_name == "chess":
-            _run_chess(state)
-            return
+            while True:
+                _run_chess(state)
+
         elif source_name == "panel":
             import panel
 
@@ -148,6 +149,8 @@ def run(source_name: str = "fake", start: float = 0.0) -> None:
         else:
             _drive_loop(state, source, engine)
             return
+    except KeyboardInterrupt:
+        return
     finally:
         engine.stop()
         print("Stopping.")
