@@ -294,11 +294,7 @@ class ChessDriver:
         """
         cols, rows = shutil.get_terminal_size(fallback=(80, 24))
         self.cell_w, self.cell_h = self._cell_size(cols, rows)
-        side = "White" if HUMAN_PLAYS_WHITE else "Black"
-        header = (
-            f"You are {side}. Stockfish searches to depth {SEARCH_DEPTH} — the harder "
-            "the position, the longer (and louder) it strains."
-        )
+        header = ""
         # Keep header/status to one line: a wrapped header would push the board down
         # and desync mouse hit-testing (see _square_at).
         out = ["\x1b[H"]
@@ -369,8 +365,7 @@ class ChessDriver:
                 buf += key
 
     def play(self) -> None:
-        status = "Your move." if self.board.turn == self.human else ""
-        result = "Resigned. Good game."
+        status = ""
         with AltScreen(), MouseTracking(), RawTerminal():
             while not self.board.is_game_over():
                 if self.board.turn == self.human:
@@ -382,10 +377,3 @@ class ChessDriver:
                     move = self._engine_move()
                     status = f"Stockfish plays {self.board.san(move)} — your move."
                     self.board.push(move)
-            if self.board.is_game_over():
-                result = (
-                    f"Game over — {self.board.result()} "
-                    f"({self.board.outcome().termination.name.lower()})"
-                )
-                self._draw(f"{result}   press any key to exit")
-                read_key()
