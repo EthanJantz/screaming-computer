@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -74,11 +75,9 @@ def _find_stockfish() -> str:
 
 # Approach A: fix the *search depth* so every move is the same "amount of thinking",
 # and let the TIME to reach that depth be the difficulty signal — an easy position
-# hits SEARCH_DEPTH in a blink (quiet), a hard one grinds for seconds (loud). This is
-# what makes "the computer is working harder" audible, where a fixed think-time (every
-# move burning ~the same node count) did not.
-SEARCH_DEPTH = 20  # plies searched per move (its "turn"); tune for your CPU's speed
-TIME_CAP = 8.0  # seconds: safety cap so a pathological position can't grind forever
+# hits SEARCH_DEPTH in a blink (quiet), a hard one grinds for seconds (loud).
+SEARCH_DEPTH = 20
+TIME_CAP = 8.0  # seconds: safety cap
 
 # Elapsed search time (seconds) mapping to idle/full effort, log-scaled because think
 # times span orders of magnitude across positions. Calibrate by ear to the spread
@@ -86,8 +85,6 @@ TIME_CAP = 8.0  # seconds: safety cap so a pathological position can't grind for
 # raise it if easy moves already peak.
 T_MIN = 0.1  # reached the depth almost instantly -> idle
 T_MAX = 4.0  # a long grind to the depth -> full-effort scream
-
-HUMAN_PLAYS_WHITE = True
 
 # --- board colors (256-color ANSI backgrounds/foregrounds) ---
 # Squares use tan/brown so both piece colors stay legible; the destination square
@@ -105,15 +102,41 @@ _RESET = "\x1b[0m"
 # drawn CELL_W columns by CELL_H rows; ~2:1 keeps them visually square on a
 # terminal's tall cells. _LABEL_W is the left gutter that holds the rank digits.
 _LABEL_W = 3
+_MIN_CELL_W = 3
 # A piece is a single terminal glyph that can't grow with the cell, so the cap is
 # deliberately small: past ~4x2 the glyph starts to look lost in the square.
 _MAX_CELL_H = 2
+_MIN_BOARD_W = _LABEL_W + 8 * _MIN_CELL_W  # the board at its smallest
+
+# The chrome around the board, as drawn by `_draw`. Sizing (_cell_size), centering
+# (pad_y) and hit-testing (_square_at) all count rows from these, so edits to the
+# frame stay in sync instead of silently desyncing clicks from what's on screen.
+_HEADERS = (
+    "click a piece or type a move",
+    "'moves' lists available moves",
+    "'q' quit",
+)
+_HEADER_ROWS = len(_HEADERS) + 1  # the headers, then a blank line
+_FOOTER_ROWS = 2  # a blank line, then the prompt; the status block sits between them
+_CHROME_ROWS = _HEADER_ROWS + _FOOTER_ROWS
 
 
 def _center(text: str, width: int) -> str:
-    """`text` centered in `width` columns (slightly left-biased for odd padding)."""
+    """Centers pieces and text during _render_board
+    `text` centered in `width` columns (slightly left-biased for odd padding)."""
     left = (width - len(text)) // 2
     return " " * left + text + " " * (width - len(text) - left)
+
+
+def _wrap(text: str, width: int = _MIN_BOARD_W) -> str:
+    """`text` broken onto as many status lines as it needs, newline-joined.
+
+    For the 'moves' list, which is far too long to read as the single run-on line
+    `_draw` would otherwise truncate at the terminal's edge. Wrapping to the board at
+    its narrowest keeps the block tucked under the board at any terminal size, and
+    keeps its height independent of the cell size `_draw` derives from it.
+    """
+    return "\n".join(textwrap.wrap(text, width))
 
 
 class ChessDriver:
@@ -123,12 +146,13 @@ class ChessDriver:
         stockfish = _find_stockfish()  # raises FileNotFoundError with an install hint
         self.state = state
         self.board = chess.Board()
-        self.human = chess.WHITE if HUMAN_PLAYS_WHITE else chess.BLACK
+        self.human = chess.WHITE
         self.selected: chess.Square | None = None  # square the mouse has picked up
-        # Cell size of the last drawn frame; _square_at hit-tests against it. Set for
-        # real on every _draw from the terminal size; this default matches a minimal
-        # board (and is what the unit tests exercise directly).
+        # Cell size and centering offsets of the last drawn frame; _square_at
+        # hit-tests against them. Set for real on every _draw from the terminal size;
+        # these defaults match a minimal, unpadded board (what the unit tests use).
         self.cell_w, self.cell_h = 3, 1
+        self.pad_x, self.pad_y = 0, 0
         self.intensity = TelemetryIntensity(T_MIN, T_MAX)
         self.engine = chess.engine.SimpleEngine.popen_uci(stockfish)
 
@@ -178,8 +202,8 @@ class ChessDriver:
                 for m in self.board.legal_moves
                 if m.from_square == self.selected
             }
-        ranks = range(7, -1, -1) if HUMAN_PLAYS_WHITE else range(8)
-        files = range(8) if HUMAN_PLAYS_WHITE else range(7, -1, -1)
+        ranks = range(7, -1, -1)
+        files = range(8)
         lines = []
         for rank in ranks:
             for sub in range(h):
@@ -215,20 +239,20 @@ class ChessDriver:
     def _square_at(self, col: int, row: int) -> chess.Square | None:
         """Map a 1-based terminal (col, row) to a board square, or None if off-board.
 
-        Inverts the fixed layout in `_draw`: header on row 1, blank row 2, then the
-        board from row 3, each rank cell_h rows tall; a cell_w-wide square after the
-        _LABEL_W-column rank gutter. Uses the same cell size the last frame drew with,
-        and reverses the orientation logic `_render_board` draws with.
+        Inverts the layout in `_draw`: pad_y blank rows, then _HEADER_ROWS of chrome,
+        so the board starts on row pad_y + _HEADER_ROWS + 1 (rows are 1-based) and
+        each rank is cell_h rows tall; a cell_w-wide square after the _LABEL_W-column
+        rank gutter, itself shifted right by pad_x. Uses the same cell size and
+        centering the last frame drew with, and reverses the orientation logic
+        `_render_board` draws with.
         """
-        line = (row - 3) // self.cell_h
-        if not 0 <= line <= 7 or col <= _LABEL_W:
+        line = (row - self.pad_y - _HEADER_ROWS - 1) // self.cell_h
+        if not 0 <= line <= 7 or col <= _LABEL_W + self.pad_x:
             return None
-        file_idx = (col - _LABEL_W - 1) // self.cell_w
+        file_idx = (col - _LABEL_W - self.pad_x - 1) // self.cell_w
         if not 0 <= file_idx <= 7:
             return None
-        if HUMAN_PLAYS_WHITE:
-            return chess.square(file_idx, 7 - line)
-        return chess.square(7 - file_idx, line)
+        return chess.square(file_idx, 7 - line)
 
     def _move_between(self, frm: chess.Square, to: chess.Square) -> chess.Move | None:
         """The legal move from `frm` to `to`, or None. Auto-queens a promotion;
@@ -273,34 +297,66 @@ class ChessDriver:
         self.selected = None
         return None, "not a legal destination — 'moves' lists the options"
 
-    def _cell_size(self, cols: int, rows: int) -> tuple[int, int]:
+    def _cell_size(self, cols: int, rows: int, status_rows: int = 1) -> tuple[int, int]:
         """Largest CELL_W x CELL_H (in terminal cells) that fits the board, its
         gutter, and the surrounding chrome in a `cols` x `rows` terminal, keeping a
-        ~2:1 aspect so squares look square. Never smaller than the minimal 3x1."""
-        # Chrome around the 8*h board lines: header, blank, file labels, blank,
-        # status, prompt = 6 rows; the gutter + 8 squares must fit `cols`.
-        h = (rows - 6) // 8
+        ~2:1 aspect so squares look square. Never smaller than the minimal 3x1.
+
+        `status_rows` is how many lines the status block needs, so a wrapped 'moves'
+        list shrinks the board to make room rather than overflowing the terminal."""
+        # Chrome around the 8*h board lines: _CHROME_ROWS, the status block, and the
+        # file-label row; the gutter + 8 squares must fit `cols`.
+        h = (rows - _CHROME_ROWS - status_rows - 1) // 8
         w_fit = (cols - _LABEL_W) // 8
         h = max(1, min(h, w_fit // 2, _MAX_CELL_H))
-        w = max(3, min(2 * h, w_fit))
+        w = max(_MIN_CELL_W, min(2 * h, w_fit))
         return w, h
 
+    def _shift(self, text: str, cols: int) -> str:
+        """`text` shifted right to line up with the centered board, still on one line.
+
+        The shift shrinks for text too long to sit at pad_x, because a wrapped line
+        would push everything below it down and desync hit-testing (see _square_at).
+        """
+        pad = min(self.pad_x, max(0, cols - len(text)))
+        return (" " * pad + text)[:cols]
+
     def _draw(self, status: str, prompt: str = "") -> None:
-        """Repaint the whole frame at a fixed position (top of the alt screen).
+        """Repaint the whole frame, centered on the alt screen.
 
         Cursor-home + clear-each-line instead of a full screen wipe, so there is
         no flicker; the cursor lands after `prompt`, where typed input echoes. The
-        board is sized to the terminal each frame, so nothing scrolls off.
+        board is sized and centered to the terminal each frame, so nothing scrolls
+        off and it stays put as the terminal is resized.
         """
         cols, rows = shutil.get_terminal_size(fallback=(80, 24))
-        self.cell_w, self.cell_h = self._cell_size(cols, rows)
-        header = ""
-        # Keep header/status to one line: a wrapped header would push the board down
-        # and desync mouse hit-testing (see _square_at).
-        out = ["\x1b[H"]
-        for line in (header[:cols], "", *self._render_board(), "", status[:cols]):
+        # A pre-wrapped status (see _wrap) spans several rows; keep it to the rows left
+        # beside a minimal board, since a frame taller than the terminal would scroll
+        # and leave every click a rank off (see _square_at).
+        room = max(1, rows - _CHROME_ROWS - 8 - 1)
+        status_lines = status.split("\n")
+        if len(status_lines) > room:  # only a very short terminal cuts a 'moves' list
+            status_lines = status_lines[:room]
+            status_lines[-1] += " …"
+        self.cell_w, self.cell_h = self._cell_size(cols, rows, len(status_lines))
+        board = self._render_board()
+        # Board lines carry color escapes, so their visual width is computed, not
+        # measured: the rank gutter plus eight squares. `board` already includes the
+        # file-label row, so only _CHROME_ROWS and the status block go on top of it.
+        self.pad_x = max(0, (cols - (_LABEL_W + 8 * self.cell_w)) // 2)
+        self.pad_y = max(
+            0, (rows - (len(board) + _CHROME_ROWS + len(status_lines))) // 2
+        )
+        out = ["\x1b[H", "\x1b[K\n" * self.pad_y]
+        for line in (
+            *(self._shift(h, cols) for h in _HEADERS),
+            "",
+            *(" " * self.pad_x + b for b in board),
+            "",
+            *(self._shift(s, cols) for s in status_lines),
+        ):
             out.append(f"\x1b[K{line}\n")
-        out.append(f"\x1b[K{prompt}\x1b[J")
+        out.append(f"\x1b[K{self._shift(prompt, cols)}\x1b[J")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -320,7 +376,8 @@ class ChessDriver:
         if raw in ("q", "quit"):
             return None, None
         if raw in ("moves", "l"):
-            return None, ", ".join(self.board.san(m) for m in self.board.legal_moves)
+            moves = ", ".join(self.board.san(m) for m in self.board.legal_moves)
+            return None, _wrap(moves)
         move = self._parse_move(raw)
         if move is None:
             return None, f"{raw!r} is not a legal move here — 'moves' lists the options"
@@ -330,7 +387,7 @@ class ChessDriver:
         """The human's turn: play by clicking (two clicks: piece, then destination)
         or by typing a move. Cbreak mode reads keys one at a time, so we echo the
         typed buffer by redrawing. Returns False if they resign/quit."""
-        prompt = "click a piece or type a move (e.g. e4, g1f3) — 'moves', 'q' quit: "
+        prompt = "#"
         flush_input()  # drop any clicks that landed while Stockfish was thinking
         self.selected = None
         buf = ""
